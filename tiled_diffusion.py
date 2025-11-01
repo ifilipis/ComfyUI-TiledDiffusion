@@ -58,6 +58,7 @@ def _patch_qwen_tiled_diffusion():
         return
 
     original_forward = QwenImageTransformer2DModel._forward
+    original_public_forward = getattr(QwenImageTransformer2DModel, "forward", None)
 
     def tiled_forward(
         self,
@@ -274,6 +275,8 @@ def _patch_qwen_tiled_diffusion():
         return hidden_states.reshape(orig_shape)[:, :, :, : x.shape[-2], : x.shape[-1]]
 
     QwenImageTransformer2DModel._forward = tiled_forward
+    if original_public_forward is original_forward:
+        QwenImageTransformer2DModel.forward = tiled_forward
     _qwen_tiled_diffusion_patched = True
 
 
@@ -287,6 +290,7 @@ def _patch_wan_tiled_diffusion():
         return
 
     original_forward = WanModel._forward
+    original_public_forward = getattr(WanModel, "forward", None)
 
     def tiled_forward(
         self,
@@ -358,7 +362,8 @@ def _patch_wan_tiled_diffusion():
                 )
             freqs = torch.cat(freqs_list, dim=0)
 
-        return self.forward_orig(
+        return original_forward(
+            self,
             x,
             timestep,
             context,
@@ -369,6 +374,8 @@ def _patch_wan_tiled_diffusion():
         )[:, :, :t, :h, :w]
 
     WanModel._forward = tiled_forward
+    if original_public_forward is original_forward:
+        WanModel.forward = tiled_forward
     _wan_tiled_diffusion_patched = True
 
 class BBox:
@@ -587,15 +594,16 @@ class AbstractDiffusion:
         if not self.supports_tiled_transformer_offsets():
             return None
         offsets: List[Dict[str, Union[int, float]]] = []
-        for bbox in bboxes:
-            base_offset: Dict[str, Union[int, float]] = {
-                "offset_x": bbox.x,
-                "offset_y": bbox.y,
-            }
-            if self.model_backend == "wan":
-                base_offset["offset_t"] = 0
+        for tile_index, bbox in enumerate(bboxes):
             for _ in range(batch_size):
-                offsets.append(base_offset.copy())
+                tile_offset: Dict[str, Union[int, float]] = {
+                    "offset_x": bbox.x,
+                    "offset_y": bbox.y,
+                    "index": tile_index,
+                }
+                if self.model_backend == "wan":
+                    tile_offset["offset_t"] = tile_index
+                offsets.append(tile_offset)
         if not offsets:
             return None
         global_info = {
