@@ -169,10 +169,13 @@ def _patch_qwen_tiled_diffusion():
                 hidden_states = torch.cat([hidden_states, kontext], dim=1)
                 img_ids = torch.cat([img_ids, kontext_ids], dim=1)
 
+        patch_size_int = int(patch_size) if isinstance(patch_size, int) else int(patch_size[0])
+        txt_ref_w = global_info.get("latent_width", x.shape[-1])
+        txt_ref_h = global_info.get("latent_height", x.shape[-2])
         txt_start = round(
             max(
-                ((x.shape[-1] + (self.patch_size // 2)) // self.patch_size) // 2,
-                ((x.shape[-2] + (self.patch_size // 2)) // self.patch_size) // 2,
+                ((txt_ref_w + (patch_size_int // 2)) // patch_size_int) // 2,
+                ((txt_ref_h + (patch_size_int // 2)) // patch_size_int) // 2,
             )
         )
         txt_ids = (
