@@ -104,57 +104,77 @@ def _patch_qwen_tiled_diffusion():
         full_h_len = ((full_h + (patch_size // 2)) // patch_size)
         full_w_len = ((full_w + (patch_size // 2)) // patch_size)
 
-        img_ids = img_ids.view(img_ids.shape[0], tile_h_len, tile_w_len, img_ids.shape[-1])
-        batch = img_ids.shape[0]
-        if offsets:
-            if len(offsets) == 1 and batch > 1:
-                offsets = offsets * batch
-            elif len(offsets) != batch:
-                if batch % len(offsets) == 0:
-                    repeat_factor = batch // len(offsets)
-                    offsets = [off for off in offsets for _ in range(repeat_factor)]
-                else:
-                    raise ValueError("Unexpected tiled diffusion offset count for Qwen batch")
+        batch_size = int(global_info.get("batch_size", x.shape[0]))
+        tile_batch_size = int(global_info.get("tile_batch_size", max(len(offsets), 1)))
+        bboxes_info = offsets_info.get("bboxes")
+        if bboxes_info is not None:
+            tile_batch_size = len(bboxes_info)
+        latents_tensor = offsets_info.get("latents")
+        if isinstance(latents_tensor, torch.Tensor) and latents_tensor.shape[0] >= batch_size:
+            tile_batch_size = latents_tensor.shape[0] // max(batch_size, 1)
+        if tile_batch_size * batch_size != hidden_states.shape[0]:
+            batch_size = hidden_states.shape[0] // max(tile_batch_size, 1)
+        if tile_batch_size == 0:
+            tile_batch_size = hidden_states.shape[0] // max(batch_size, 1)
+
         if len(offsets) == 0:
-            offsets = [{"offset_x": 0, "offset_y": 0, "index": 0}] * batch
+            offsets = [{"offset_x": 0, "offset_y": 0, "index": i} for i in range(tile_batch_size)]
+
+        img_ids = img_ids.view(tile_batch_size, batch_size, tile_h_len, tile_w_len, img_ids.shape[-1])
+        hidden_states = hidden_states.view(tile_batch_size, batch_size, tile_h_len * tile_w_len, hidden_states.shape[-1])
 
         global_center_h = (full_h_len - 1) / 2.0
         global_center_w = (full_w_len - 1) / 2.0
-        diag_shifts = []
 
-        for i in range(batch):
-            off = offsets[i]
-            index = off.get("index", 0)
+        global_tokens = hidden_states.new_zeros((batch_size, full_h_len, full_w_len, hidden_states.shape[-1]))
+        global_counts = hidden_states.new_zeros((batch_size, full_h_len, full_w_len, 1))
+        global_img_ids = img_ids.new_zeros((batch_size, full_h_len, full_w_len, img_ids.shape[-1]))
+        global_img_counts = img_ids.new_zeros((batch_size, full_h_len, full_w_len, 1))
+
+        tile_slices: List[Tuple[int, int, int, int]] = []
+        diag_shifts = torch.zeros((tile_batch_size,), device=x.device, dtype=img_ids.dtype)
+
+        y_template = torch.arange(tile_h_len, device=img_ids.device, dtype=img_ids.dtype)
+        x_template = torch.arange(tile_w_len, device=img_ids.device, dtype=img_ids.dtype)
+
+        for tile_index in range(tile_batch_size):
+            off = offsets[tile_index % len(offsets)]
+            index = off.get("index", tile_index)
             h_offset = off.get("offset_y", 0)
             w_offset = off.get("offset_x", 0)
-            h_start = (h_offset + (patch_size // 2)) // patch_size
-            w_start = (w_offset + (patch_size // 2)) // patch_size
-            img_ids[i, :, :, 0] = torch.as_tensor(index, dtype=img_ids.dtype, device=img_ids.device)
-            img_ids[i, :, :, 1] = (
-                torch.linspace(
-                    h_start,
-                    h_start + tile_h_len - 1,
-                    steps=tile_h_len,
-                    device=img_ids.device,
-                    dtype=img_ids.dtype,
-                ).unsqueeze(1)
-                - float(global_center_h)
-            )
-            img_ids[i, :, :, 2] = (
-                torch.linspace(
-                    w_start,
-                    w_start + tile_w_len - 1,
-                    steps=tile_w_len,
-                    device=img_ids.device,
-                    dtype=img_ids.dtype,
-                ).unsqueeze(0)
-                - float(global_center_w)
-            )
+            h_start = int((h_offset + (patch_size // 2)) // patch_size)
+            w_start = int((w_offset + (patch_size // 2)) // patch_size)
+            h_end = h_start + tile_h_len
+            w_end = w_start + tile_w_len
+
+            tile_slices.append((h_start, h_end, w_start, w_end))
+
+            img_tile = img_ids[tile_index]
+            img_tile[..., 0] = torch.as_tensor(index, dtype=img_tile.dtype, device=img_tile.device)
+            img_tile[..., 1] = (y_template.view(1, tile_h_len, 1) + h_start - global_center_h)
+            img_tile[..., 2] = (x_template.view(1, 1, tile_w_len) + w_start - global_center_w)
+
+            tokens_tile = hidden_states[tile_index].view(batch_size, tile_h_len, tile_w_len, -1)
+
+            global_tokens[:, h_start:h_end, w_start:w_end, :] += tokens_tile
+            global_counts[:, h_start:h_end, w_start:w_end, :] += 1
+
+            global_img_ids[:, h_start:h_end, w_start:w_end, :] += img_tile
+            global_img_counts[:, h_start:h_end, w_start:w_end, :] += 1
+
             h_center = h_start + (tile_h_len - 1) / 2.0
             w_center = w_start + (tile_w_len - 1) / 2.0
-            diag_shifts.append(max(h_center - global_center_h, w_center - global_center_w))
+            diag_value = max(h_center - global_center_h, w_center - global_center_w)
+            diag_shifts[tile_index] = diag_value
 
-        img_ids = img_ids.view(batch, -1, img_ids.shape[-1])
+        global_counts = torch.where(global_counts == 0, torch.ones_like(global_counts), global_counts)
+        global_tokens = global_tokens / global_counts
+
+        global_img_counts = torch.where(global_img_counts == 0, torch.ones_like(global_img_counts), global_img_counts)
+        global_img_ids = global_img_ids / global_img_counts
+
+        hidden_states = global_tokens.view(batch_size, -1, hidden_states.shape[-1])
+        img_ids = global_img_ids.view(batch_size, -1, global_img_ids.shape[-1])
 
         if ref_latents is not None:
             h = 0
@@ -182,6 +202,28 @@ def _patch_qwen_tiled_diffusion():
                 img_ids = torch.cat([img_ids, kontext_ids], dim=1)
 
         patch_size_int = int(patch_size) if isinstance(patch_size, int) else int(patch_size[0])
+        if isinstance(timestep, torch.Tensor) and timestep.shape and timestep.shape[0] == tile_batch_size * batch_size:
+            timestep = timestep.reshape(tile_batch_size, batch_size, *timestep.shape[1:])[0]
+
+        if encoder_hidden_states is not None and encoder_hidden_states.shape[0] != hidden_states.shape[0]:
+            if encoder_hidden_states.shape[0] == tile_batch_size * batch_size:
+                encoder_hidden_states = encoder_hidden_states.reshape(
+                    tile_batch_size, batch_size, *encoder_hidden_states.shape[1:]
+                )[0]
+            else:
+                encoder_hidden_states = encoder_hidden_states[: hidden_states.shape[0]]
+
+        if encoder_hidden_states_mask is not None and encoder_hidden_states_mask.shape[0] != hidden_states.shape[0]:
+            if encoder_hidden_states_mask.shape[0] == tile_batch_size * batch_size:
+                encoder_hidden_states_mask = encoder_hidden_states_mask.reshape(
+                    tile_batch_size, batch_size, *encoder_hidden_states_mask.shape[1:]
+                )[0]
+            else:
+                encoder_hidden_states_mask = encoder_hidden_states_mask[: hidden_states.shape[0]]
+
+        if guidance is not None and guidance.shape[0] == tile_batch_size * batch_size:
+            guidance = guidance.reshape(tile_batch_size, batch_size, *guidance.shape[1:])[0]
+
         txt_ref_w = global_info.get("latent_width", x.shape[-1])
         txt_ref_h = global_info.get("latent_height", x.shape[-2])
         txt_start = round(
@@ -198,11 +240,14 @@ def _patch_qwen_tiled_diffusion():
                 dtype=img_ids.dtype,
             )
             .reshape(1, -1, 1)
-            .repeat(x.shape[0], 1, 3)
+            .repeat(hidden_states.shape[0], 1, 3)
         )
-        if diag_shifts:
-            txt_shift_tensor = torch.as_tensor(diag_shifts, device=x.device, dtype=img_ids.dtype)
-            txt_ids += txt_shift_tensor.view(txt_shift_tensor.shape[0], 1, 1)
+        diag_shifts_per_sample = None
+        if diag_shifts.numel() > 0:
+            diag_value = diag_shifts.max().to(img_ids.dtype)
+            diag_shifts_per_sample = diag_value.repeat(hidden_states.shape[0])
+        if diag_shifts_per_sample is not None:
+            txt_ids += diag_shifts_per_sample.view(diag_shifts_per_sample.shape[0], 1, 1)
         ids = torch.cat((txt_ids, img_ids), dim=1)
         image_rotary_emb = self.pe_embedder(ids).squeeze(1).unsqueeze(2).to(x.dtype)
         del ids, txt_ids, img_ids
@@ -271,6 +316,17 @@ def _patch_qwen_tiled_diffusion():
 
         hidden_states = self.norm_out(hidden_states, temb)
         hidden_states = self.proj_out(hidden_states)
+
+        hidden_states = hidden_states.view(batch_size, full_h_len, full_w_len, hidden_states.shape[-1])
+        tile_outputs = []
+        for h_start, h_end, w_start, w_end in tile_slices:
+            tile_tokens = hidden_states[:, h_start:h_end, w_start:w_end, :].reshape(
+                batch_size, -1, hidden_states.shape[-1]
+            )
+            tile_outputs.append(tile_tokens)
+        hidden_states = torch.stack(tile_outputs, dim=0).reshape(
+            tile_batch_size * batch_size, -1, hidden_states.shape[-1]
+        )
 
         hidden_states = hidden_states[:, :num_embeds].view(
             orig_shape[0], orig_shape[-2] // 2, orig_shape[-1] // 2, orig_shape[1], 2, 2
@@ -622,7 +678,13 @@ class AbstractDiffusion:
         }
         return {"offsets": offsets, "global": global_info}
 
-    def prepare_transformer_options(self, transformer_options, bboxes: List[BBox], batch_size: int):
+    def prepare_transformer_options(
+        self,
+        transformer_options,
+        bboxes: List[BBox],
+        batch_size: int,
+        latents: Tensor = None,
+    ):
         if not self.supports_tiled_transformer_offsets():
             return transformer_options
         offsets = self.build_transformer_offsets(bboxes, batch_size)
@@ -632,6 +694,9 @@ class AbstractDiffusion:
             transformer_options = {}
         else:
             transformer_options = copy.deepcopy(transformer_options)
+        offsets["bboxes"] = [bbox.box[:] for bbox in bboxes]
+        if latents is not None:
+            offsets["latents"] = latents
         transformer_options["tiled_diffusion_offsets"] = offsets
         return transformer_options
 
@@ -993,7 +1058,7 @@ class MultiDiffusion(AbstractDiffusion):
                     c_tile[k] = v
 
                 transformer_options = c_tile.get("transformer_options", None)
-                transformer_options = self.prepare_transformer_options(transformer_options, bboxes, N)
+                transformer_options = self.prepare_transformer_options(transformer_options, bboxes, N, x_tile)
                 if transformer_options is not None:
                     c_tile["transformer_options"] = transformer_options
 
@@ -1162,7 +1227,7 @@ class SpotDiffusion(AbstractDiffusion):
                     c_tile[k] = v
 
                 transformer_options = c_tile.get("transformer_options", None)
-                transformer_options = self.prepare_transformer_options(transformer_options, bboxes, N)
+                transformer_options = self.prepare_transformer_options(transformer_options, bboxes, N, x_tile)
                 if transformer_options is not None:
                     c_tile["transformer_options"] = transformer_options
 
@@ -1294,7 +1359,7 @@ class MixtureOfDiffusers(AbstractDiffusion):
                     c_tile[k] = v
 
                 transformer_options = c_tile.get("transformer_options", None)
-                transformer_options = self.prepare_transformer_options(transformer_options, bboxes, N)
+                transformer_options = self.prepare_transformer_options(transformer_options, bboxes, N, x_tile)
                 if transformer_options is not None:
                     c_tile["transformer_options"] = transformer_options
 
