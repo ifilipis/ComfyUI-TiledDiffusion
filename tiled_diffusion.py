@@ -367,6 +367,19 @@ class BBox:
     def __getitem__(self, idx:int) -> int:
         return self.box[idx]
 
+    def _spatial_slices(self):
+        return slice(self.y, self.y + self.h), slice(self.x, self.x + self.w)
+
+    def get_latent_slicer(self, latent_dimensions: int):
+        if latent_dimensions == 2:
+            base = [slice(None), slice(None)]
+        elif latent_dimensions == 3:
+            base = [slice(None), slice(None), slice(None)]
+        else:
+            raise ValueError(f"Unsupported latent dimensions: {latent_dimensions}")
+        base.extend(self._spatial_slices())
+        return tuple(base)
+
 def repeat_to_batch_size(tensor, batch_size, dim=0):
     if dim == 0 and tensor.shape[dim] == 1:
         return tensor.expand([batch_size] + [-1] * (len(tensor.shape) - 1))
@@ -486,6 +499,38 @@ class AbstractDiffusion:
         self.tile_height = tile_height
         self.tile_overlap = tile_overlap
         self.tile_batch_size = tile_batch_size
+
+    def _latent_dimensions_from_tensor(self, tensor: Tensor) -> int:
+        dims = tensor.dim() - 2
+        if dims < 2:
+            raise ValueError(f"Unsupported latent rank for tiled diffusion: {tensor.shape}")
+        if dims > 3:
+            raise ValueError(f"Latent tensors with {dims} spatial dimensions are not supported")
+        return dims
+
+    def _bbox_slicer_for_tensor(self, bbox: BBox, tensor: Tensor):
+        return bbox.get_latent_slicer(self._latent_dimensions_from_tensor(tensor))
+
+    @staticmethod
+    def _align_weight_dims(weight, latent_dimensions: int, ref_tensor: Tensor = None) -> Tensor:
+        if not isinstance(weight, torch.Tensor):
+            weight = torch.as_tensor(weight, device=ref_tensor.device if ref_tensor is not None else devices.device)
+        elif ref_tensor is not None:
+            weight = weight.to(device=ref_tensor.device, dtype=ref_tensor.dtype)
+        expected_dim = 2 + latent_dimensions
+        while weight.dim() < expected_dim:
+            weight = weight.unsqueeze(0)
+        return weight
+
+    def _set_latent_shape(self, x_in: Tensor):
+        latent_dimensions = self._latent_dimensions_from_tensor(x_in)
+        self.latent_dimensions = latent_dimensions
+        if latent_dimensions == 2:
+            self.latent_depth = 1
+        else:
+            self.latent_depth = x_in.shape[2]
+        self.h = x_in.shape[-2]
+        self.w = x_in.shape[-1]
 
     def configure_model(self, model: ModelPatcher):
         base_model = getattr(model, "model", None)
@@ -857,17 +902,20 @@ class MultiDiffusion(AbstractDiffusion):
         c_in: dict = args["c"]
         cond_or_uncond: List = args["cond_or_uncond"]
 
-        N, C, H, W = x_in.shape
+        prev_h, prev_w = self.h, self.w
+        prev_depth = self.latent_depth
+        self._set_latent_shape(x_in)
+        N = x_in.shape[0]
+        C = x_in.shape[1]
 
         # comfyui can feed in a latent that's a different size cause of SetArea, so we'll refresh in that case.
         self.refresh = False
-        if self.weights is None or self.h != H or self.w != W:
-            self.h, self.w = H, W
+        depth_changed = self.latent_dimensions == 3 and prev_depth != self.latent_depth
+        if self.weights is None or prev_h != self.h or prev_w != self.w or depth_changed:
             self.refresh = True
             self.init_grid_bbox(self.tile_width, self.tile_height, self.tile_overlap, self.tile_batch_size)
             # init everything done, perform sanity check & pre-computations
             self.init_done()
-        self.h, self.w = H, W
         # clear buffer canvas
         self.reset_buffer(x_in)
 
@@ -879,7 +927,9 @@ class MultiDiffusion(AbstractDiffusion):
                     return x_in
 
                 # batching & compute tiles
-                x_tile = torch.cat([x_in[bbox.slicer] for bbox in bboxes], dim=0)   # [TB, C, TH, TW]
+                x_tile = torch.cat([
+                    x_in[self._bbox_slicer_for_tensor(bbox, x_in)] for bbox in bboxes
+                ], dim=0)   # [TB, C, TH, TW]
                 t_tile = repeat_to_batch_size(t_in, x_tile.shape[0])
                 c_tile = {}
                 for k, v in c_in.items():
@@ -898,7 +948,9 @@ class MultiDiffusion(AbstractDiffusion):
                                     x_in.device,
                                     self.get_tile_weights,
                                 )
-                            v = torch.cat([v[bbox_.slicer] for bbox_ in bboxes_[batch_id]])
+                            v = torch.cat([
+                                v[self._bbox_slicer_for_tensor(bbox_, v)] for bbox_ in bboxes_[batch_id]
+                            ])
                         if v.shape[0] != x_tile.shape[0]:
                             v = repeat_to_batch_size(v, x_tile.shape[0])
                     elif k == "transformer_options" and isinstance(v, dict):
@@ -923,7 +975,7 @@ class MultiDiffusion(AbstractDiffusion):
                 x_tile_out = model_function(x_tile, t_tile, **c_tile)
 
                 for i, bbox in enumerate(bboxes):
-                    self.x_buffer[bbox.slicer] += x_tile_out[i*N:(i+1)*N, :, :, :]
+                    self.x_buffer[self._bbox_slicer_for_tensor(bbox, self.x_buffer)] += x_tile_out[i*N:(i+1)*N, ...]
                 del x_tile_out, x_tile, t_tile, c_tile
 
                 # update progress bar
@@ -972,17 +1024,20 @@ class SpotDiffusion(AbstractDiffusion):
         c_in: dict = args["c"]
         cond_or_uncond: List = args["cond_or_uncond"]
 
-        N, C, H, W = x_in.shape
+        prev_h, prev_w = self.h, self.w
+        prev_depth = self.latent_depth
+        self._set_latent_shape(x_in)
+        N = x_in.shape[0]
+        C = x_in.shape[1]
 
         # comfyui can feed in a latent that's a different size cause of SetArea, so we'll refresh in that case.
         self.refresh = False
-        if self.weights is None or self.h != H or self.w != W:
-            self.h, self.w = H, W
+        depth_changed = self.latent_dimensions == 3 and prev_depth != self.latent_depth
+        if self.weights is None or prev_h != self.h or prev_w != self.w or depth_changed:
             self.refresh = True
             self.init_grid_bbox(self.tile_width, self.tile_height, self.tile_overlap, self.tile_batch_size)
             # init everything done, perform sanity check & pre-computations
             self.init_done()
-        self.h, self.w = H, W
         # clear buffer canvas
         self.reset_buffer(x_in)
 
@@ -1038,7 +1093,9 @@ class SpotDiffusion(AbstractDiffusion):
                     return x_in
 
                 # batching & compute tiles
-                x_tile = torch.cat([x_in[bbox.slicer] for bbox in bboxes], dim=0)   # [TB, C, TH, TW]
+                x_tile = torch.cat([
+                    x_in[self._bbox_slicer_for_tensor(bbox, x_in)] for bbox in bboxes
+                ], dim=0)   # [TB, C, TH, TW]
                 t_tile = repeat_to_batch_size(t_in, x_tile.shape[0])
                 c_tile = {}
                 for k, v in c_in.items():
@@ -1060,7 +1117,9 @@ class SpotDiffusion(AbstractDiffusion):
                                 )
                                 sh_h_new, sh_w_new = round(sh_h * self.compression / cf), round(sh_w * self.compression / cf)
                             v = v.roll(shifts=(sh_h_new, sh_w_new), dims=(-2,-1))
-                            v = torch.cat([v[bbox_.slicer] for bbox_ in bboxes_[batch_id]])
+                            v = torch.cat([
+                                v[self._bbox_slicer_for_tensor(bbox_, v)] for bbox_ in bboxes_[batch_id]
+                            ])
                         if v.shape[0] != x_tile.shape[0]:
                             v = repeat_to_batch_size(v, x_tile.shape[0])
                     elif k == "transformer_options" and isinstance(v, dict):
@@ -1085,7 +1144,7 @@ class SpotDiffusion(AbstractDiffusion):
                 x_tile_out = model_function(x_tile, t_tile, **c_tile)
 
                 for i, bbox in enumerate(bboxes):
-                    self.x_buffer[bbox.slicer] = x_tile_out[i*N:(i+1)*N, :, :, :]
+                    self.x_buffer[self._bbox_slicer_for_tensor(bbox, self.x_buffer)] = x_tile_out[i*N:(i+1)*N, ...]
 
                 del x_tile_out, x_tile, t_tile, c_tile
 
@@ -1141,17 +1200,19 @@ class MixtureOfDiffusers(AbstractDiffusion):
         c_in: dict = args["c"]
         cond_or_uncond: List= args["cond_or_uncond"]
 
-        N, C, H, W = x_in.shape
+        prev_h, prev_w = self.h, self.w
+        prev_depth = self.latent_depth
+        self._set_latent_shape(x_in)
+        N = x_in.shape[0]
+        C = x_in.shape[1]
 
         self.refresh = False
-        # self.refresh = True
-        if self.weights is None or self.h != H or self.w != W:
-            self.h, self.w = H, W
+        depth_changed = self.latent_dimensions == 3 and prev_depth != self.latent_depth
+        if self.weights is None or prev_h != self.h or prev_w != self.w or depth_changed:
             self.refresh = True
             self.init_grid_bbox(self.tile_width, self.tile_height, self.tile_overlap, self.tile_batch_size)
             # init everything done, perform sanity check & pre-computations
             self.init_done()
-        self.h, self.w = H, W
         # clear buffer canvas
         self.reset_buffer(x_in)
 
@@ -1167,7 +1228,7 @@ class MixtureOfDiffusers(AbstractDiffusion):
                 # batching
                 x_tile_list     = []
                 for bbox in bboxes:
-                    x_tile_list.append(x_in[bbox.slicer])
+                    x_tile_list.append(x_in[self._bbox_slicer_for_tensor(bbox, x_in)])
 
                 x_tile = torch.cat(x_tile_list, dim=0)                     # differs each
                 t_tile = repeat_to_batch_size(t_in, x_tile.shape[0])   # just repeat
@@ -1188,7 +1249,9 @@ class MixtureOfDiffusers(AbstractDiffusion):
                                     x_in.device,
                                     lambda: self.get_weight(tile_w, tile_h),
                                 )
-                            v = torch.cat([v[bbox_.slicer] for bbox_ in bboxes_[batch_id]])
+                            v = torch.cat([
+                                v[self._bbox_slicer_for_tensor(bbox_, v)] for bbox_ in bboxes_[batch_id]
+                            ])
                         if v.shape[0] != x_tile.shape[0]:
                             v = repeat_to_batch_size(v, x_tile.shape[0])
                     elif k == "transformer_options" and isinstance(v, dict):
@@ -1217,8 +1280,10 @@ class MixtureOfDiffusers(AbstractDiffusion):
                 for i, bbox in enumerate(bboxes):
                     # These weights can be calcluated in advance, but will cost a lot of vram 
                     # when you have many tiles. So we calculate it here.
-                    w = self.tile_weights * self.rescale_factor[bbox.slicer]
-                    self.x_buffer[bbox.slicer] += x_tile_out[i*N:(i+1)*N, :, :, :] * w
+                    rescale = self._align_weight_dims(self.rescale_factor[bbox.slicer], self.latent_dimensions)
+                    weights = self._align_weight_dims(self.tile_weights, self.latent_dimensions, ref_tensor=rescale)
+                    w = weights * rescale
+                    self.x_buffer[self._bbox_slicer_for_tensor(bbox, self.x_buffer)] += x_tile_out[i*N:(i+1)*N, ...] * w
                 del x_tile_out, x_tile, t_tile, c_tile
 
                 # self.update_pbar()
