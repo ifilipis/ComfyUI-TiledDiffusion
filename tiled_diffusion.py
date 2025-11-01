@@ -1,3 +1,4 @@
+import copy
 import torch
 from torch import Tensor
 from typing import List, Union, Tuple, Callable, Dict
@@ -10,6 +11,7 @@ from comfy.model_base import BaseModel
 from comfy.model_patcher import ModelPatcher
 from comfy.controlnet import ControlNet, T2IAdapter
 from comfy.utils import common_upscale
+import comfy.ldm.common_dit
 from comfy.model_management import processing_interrupted, loaded_models, load_models_gpu
 from math import pi
 
@@ -42,6 +44,348 @@ grid_bbox      = null_decorator
 custom_bbox    = null_decorator
 noise_inverse  = null_decorator
 
+_qwen_tiled_diffusion_patched = False
+_wan_tiled_diffusion_patched = False
+
+
+def _patch_qwen_tiled_diffusion():
+    global _qwen_tiled_diffusion_patched
+    if _qwen_tiled_diffusion_patched:
+        return
+    try:
+        from comfy.ldm.qwen_image.model import QwenImageTransformer2DModel  # type: ignore
+    except Exception:
+        return
+
+    original_forward = QwenImageTransformer2DModel._forward
+    original_public_forward = getattr(QwenImageTransformer2DModel, "forward", None)
+
+    def tiled_forward(
+        self,
+        x,
+        timesteps,
+        context,
+        attention_mask=None,
+        guidance: torch.Tensor = None,
+        ref_latents=None,
+        transformer_options={},
+        control=None,
+        **kwargs,
+    ):
+        offsets_info = transformer_options.get("tiled_diffusion_offsets")
+        if not offsets_info:
+            return original_forward(
+                self,
+                x,
+                timesteps,
+                context,
+                attention_mask=attention_mask,
+                guidance=guidance,
+                ref_latents=ref_latents,
+                transformer_options=transformer_options,
+                control=control,
+                **kwargs,
+            )
+
+        timestep = timesteps
+        encoder_hidden_states = context
+        encoder_hidden_states_mask = attention_mask
+
+        hidden_states, img_ids, orig_shape = self.process_img(x)
+        num_embeds = hidden_states.shape[1]
+
+        offsets = offsets_info.get("offsets", [])
+        global_info = offsets_info.get("global", {})
+        patch_size = getattr(self, "patch_size", 2)
+        tile_h_len = ((orig_shape[-2] + (patch_size // 2)) // patch_size)
+        tile_w_len = ((orig_shape[-1] + (patch_size // 2)) // patch_size)
+        full_h = global_info.get("latent_height", orig_shape[-2])
+        full_w = global_info.get("latent_width", orig_shape[-1])
+        full_h_len = ((full_h + (patch_size // 2)) // patch_size)
+        full_w_len = ((full_w + (patch_size // 2)) // patch_size)
+
+        img_ids = img_ids.view(img_ids.shape[0], tile_h_len, tile_w_len, img_ids.shape[-1])
+        batch = img_ids.shape[0]
+        if offsets:
+            if len(offsets) == 1 and batch > 1:
+                offsets = offsets * batch
+            elif len(offsets) != batch:
+                if batch % len(offsets) == 0:
+                    repeat_factor = batch // len(offsets)
+                    offsets = [off for off in offsets for _ in range(repeat_factor)]
+                else:
+                    raise ValueError("Unexpected tiled diffusion offset count for Qwen batch")
+        if len(offsets) == 0:
+            offsets = [{"offset_x": 0, "offset_y": 0, "index": 0}] * batch
+
+        global_center_h = (full_h_len - 1) / 2.0
+        global_center_w = (full_w_len - 1) / 2.0
+        diag_shifts = []
+
+        for i in range(batch):
+            off = offsets[i]
+            index = off.get("index", 0)
+            h_offset = off.get("offset_y", 0)
+            w_offset = off.get("offset_x", 0)
+            h_start = (h_offset + (patch_size // 2)) // patch_size
+            w_start = (w_offset + (patch_size // 2)) // patch_size
+            img_ids[i, :, :, 0] = torch.as_tensor(index, dtype=img_ids.dtype, device=img_ids.device)
+            img_ids[i, :, :, 1] = (
+                torch.linspace(
+                    h_start,
+                    h_start + tile_h_len - 1,
+                    steps=tile_h_len,
+                    device=img_ids.device,
+                    dtype=img_ids.dtype,
+                ).unsqueeze(1)
+                - float(global_center_h)
+            )
+            img_ids[i, :, :, 2] = (
+                torch.linspace(
+                    w_start,
+                    w_start + tile_w_len - 1,
+                    steps=tile_w_len,
+                    device=img_ids.device,
+                    dtype=img_ids.dtype,
+                ).unsqueeze(0)
+                - float(global_center_w)
+            )
+            h_center = h_start + (tile_h_len - 1) / 2.0
+            w_center = w_start + (tile_w_len - 1) / 2.0
+            diag_shifts.append(max(h_center - global_center_h, w_center - global_center_w))
+
+        img_ids = img_ids.view(batch, -1, img_ids.shape[-1])
+
+        if ref_latents is not None:
+            h = 0
+            w = 0
+            index = 0
+            index_ref_method = kwargs.get("ref_latents_method", "index") == "index"
+            for ref in ref_latents:
+                if index_ref_method:
+                    index += 1
+                    h_offset = 0
+                    w_offset = 0
+                else:
+                    index = 1
+                    h_offset = 0
+                    w_offset = 0
+                    if ref.shape[-2] + h > ref.shape[-1] + w:
+                        w_offset = w
+                    else:
+                        h_offset = h
+                    h = max(h, ref.shape[-2] + h_offset)
+                    w = max(w, ref.shape[-1] + w_offset)
+
+                kontext, kontext_ids, _ = self.process_img(ref, index=index, h_offset=h_offset, w_offset=w_offset)
+                hidden_states = torch.cat([hidden_states, kontext], dim=1)
+                img_ids = torch.cat([img_ids, kontext_ids], dim=1)
+
+        patch_size_int = int(patch_size) if isinstance(patch_size, int) else int(patch_size[0])
+        txt_ref_w = global_info.get("latent_width", x.shape[-1])
+        txt_ref_h = global_info.get("latent_height", x.shape[-2])
+        txt_start = round(
+            max(
+                ((txt_ref_w + (patch_size_int // 2)) // patch_size_int) // 2,
+                ((txt_ref_h + (patch_size_int // 2)) // patch_size_int) // 2,
+            )
+        )
+        txt_ids = (
+            torch.arange(
+                txt_start,
+                txt_start + context.shape[1],
+                device=x.device,
+                dtype=img_ids.dtype,
+            )
+            .reshape(1, -1, 1)
+            .repeat(x.shape[0], 1, 3)
+        )
+        if diag_shifts:
+            txt_shift_tensor = torch.as_tensor(diag_shifts, device=x.device, dtype=img_ids.dtype)
+            txt_ids += txt_shift_tensor.view(txt_shift_tensor.shape[0], 1, 1)
+        ids = torch.cat((txt_ids, img_ids), dim=1)
+        image_rotary_emb = self.pe_embedder(ids).squeeze(1).unsqueeze(2).to(x.dtype)
+        del ids, txt_ids, img_ids
+
+        hidden_states = self.img_in(hidden_states)
+        encoder_hidden_states = self.txt_norm(encoder_hidden_states)
+        encoder_hidden_states = self.txt_in(encoder_hidden_states)
+
+        if guidance is not None:
+            guidance = guidance * 1000
+
+        temb = (
+            self.time_text_embed(timestep, hidden_states)
+            if guidance is None
+            else self.time_text_embed(timestep, guidance, hidden_states)
+        )
+
+        patches_replace = transformer_options.get("patches_replace", {})
+        patches = transformer_options.get("patches", {})
+        blocks_replace = patches_replace.get("dit", {})
+
+        for i, block in enumerate(self.transformer_blocks):
+            if ("double_block", i) in blocks_replace:
+                def block_wrap(args):
+                    out = {}
+                    out["txt"], out["img"] = block(
+                        hidden_states=args["img"],
+                        encoder_hidden_states=args["txt"],
+                        encoder_hidden_states_mask=encoder_hidden_states_mask,
+                        temb=args["vec"],
+                        image_rotary_emb=args["pe"],
+                        transformer_options=args["transformer_options"],
+                    )
+                    return out
+
+                out = blocks_replace[("double_block", i)](
+                    {"img": hidden_states, "txt": encoder_hidden_states, "vec": temb, "pe": image_rotary_emb, "transformer_options": transformer_options},
+                    {"original_block": block_wrap},
+                )
+                hidden_states = out["img"]
+                encoder_hidden_states = out["txt"]
+            else:
+                encoder_hidden_states, hidden_states = block(
+                    hidden_states=hidden_states,
+                    encoder_hidden_states=encoder_hidden_states,
+                    encoder_hidden_states_mask=encoder_hidden_states_mask,
+                    temb=temb,
+                    image_rotary_emb=image_rotary_emb,
+                    transformer_options=transformer_options,
+                )
+
+            if "double_block" in patches:
+                for p in patches["double_block"]:
+                    out = p(
+                        {"img": hidden_states, "txt": encoder_hidden_states, "x": x, "block_index": i, "transformer_options": transformer_options}
+                    )
+                    hidden_states = out["img"]
+                    encoder_hidden_states = out["txt"]
+
+            if control is not None:  # Controlnet
+                control_i = control.get("input")
+                if i < len(control_i):
+                    add = control_i[i]
+                    if add is not None:
+                        hidden_states[:, : add.shape[1]] += add
+
+        hidden_states = self.norm_out(hidden_states, temb)
+        hidden_states = self.proj_out(hidden_states)
+
+        hidden_states = hidden_states[:, :num_embeds].view(
+            orig_shape[0], orig_shape[-2] // 2, orig_shape[-1] // 2, orig_shape[1], 2, 2
+        )
+        hidden_states = hidden_states.permute(0, 3, 1, 4, 2, 5)
+        return hidden_states.reshape(orig_shape)[:, :, :, : x.shape[-2], : x.shape[-1]]
+
+    QwenImageTransformer2DModel._forward = tiled_forward
+    if original_public_forward is original_forward:
+        QwenImageTransformer2DModel.forward = tiled_forward
+    _qwen_tiled_diffusion_patched = True
+
+
+def _patch_wan_tiled_diffusion():
+    global _wan_tiled_diffusion_patched
+    if _wan_tiled_diffusion_patched:
+        return
+    try:
+        from comfy.ldm.wan.model import WanModel  # type: ignore
+    except Exception:
+        return
+
+    original_forward = WanModel._forward
+    original_public_forward = getattr(WanModel, "forward", None)
+
+    def tiled_forward(
+        self,
+        x,
+        timestep,
+        context,
+        clip_fea=None,
+        time_dim_concat=None,
+        transformer_options={},
+        **kwargs,
+    ):
+        offsets_info = transformer_options.get("tiled_diffusion_offsets")
+
+        bs, c, t, h, w = x.shape
+        x = comfy.ldm.common_dit.pad_to_patch_size(x, self.patch_size)
+
+        t_len = t
+        if time_dim_concat is not None:
+            time_dim_concat = comfy.ldm.common_dit.pad_to_patch_size(time_dim_concat, self.patch_size)
+            x = torch.cat([x, time_dim_concat], dim=2)
+            t_len = x.shape[2]
+
+        if self.ref_conv is not None and "reference_latent" in kwargs:
+            t_len += 1
+
+        if not offsets_info:
+            freqs = self.rope_encode(
+                t_len,
+                h,
+                w,
+                device=x.device,
+                dtype=x.dtype,
+                transformer_options=transformer_options,
+            )
+        else:
+            offsets = offsets_info.get("offsets", [])
+            patch_size = getattr(self, "patch_size", (1, 2, 2))
+            rope_base = transformer_options.get("rope_options", None)
+            if offsets:
+                if len(offsets) == 1 and bs > 1:
+                    offsets = offsets * bs
+                elif len(offsets) != bs:
+                    if bs % len(offsets) == 0:
+                        repeat_factor = bs // len(offsets)
+                        offsets = [off for off in offsets for _ in range(repeat_factor)]
+                    else:
+                        raise ValueError("Unexpected tiled diffusion offset count for Wan batch")
+            if len(offsets) == 0:
+                offsets = [{"offset_x": 0, "offset_y": 0, "offset_t": 0}] * bs
+
+            freqs_list = []
+            for off in offsets:
+                local_rope = {} if rope_base is None else rope_base.copy()
+                t_start = 0
+                if patch_size[0] != 0:
+                    t_start = (off.get("offset_t", 0) + (patch_size[0] // 2)) // patch_size[0]
+                h_start = (off.get("offset_y", 0) + (patch_size[1] // 2)) // patch_size[1]
+                w_start = (off.get("offset_x", 0) + (patch_size[2] // 2)) // patch_size[2]
+                local_rope["shift_t"] = local_rope.get("shift_t", 0.0) + float(t_start)
+                local_rope["shift_y"] = local_rope.get("shift_y", 0.0) + float(h_start)
+                local_rope["shift_x"] = local_rope.get("shift_x", 0.0) + float(w_start)
+                local_transformer_options = transformer_options.copy()
+                local_transformer_options["rope_options"] = local_rope
+                freqs_list.append(
+                    self.rope_encode(
+                        t_len,
+                        h,
+                        w,
+                        device=x.device,
+                        dtype=x.dtype,
+                        transformer_options=local_transformer_options,
+                    )
+                )
+            freqs = torch.cat(freqs_list, dim=0)
+
+        return original_forward(
+            self,
+            x,
+            timestep,
+            context,
+            clip_fea=clip_fea,
+            freqs=freqs,
+            transformer_options=transformer_options,
+            **kwargs,
+        )[:, :, :t, :h, :w]
+
+    WanModel._forward = tiled_forward
+    if original_public_forward is original_forward:
+        WanModel.forward = tiled_forward
+    _wan_tiled_diffusion_patched = True
+
 class BBox:
     ''' grid bbox '''
 
@@ -52,9 +396,23 @@ class BBox:
         self.h = h
         self.box = [x, y, x+w, y+h]
         self.slicer = slice(None), slice(None), slice(y, y+h), slice(x, x+w)
+        self.global_index = None
 
     def __getitem__(self, idx:int) -> int:
         return self.box[idx]
+
+    def _spatial_slices(self):
+        return slice(self.y, self.y + self.h), slice(self.x, self.x + self.w)
+
+    def get_latent_slicer(self, latent_dimensions: int):
+        if latent_dimensions == 2:
+            base = [slice(None), slice(None)]
+        elif latent_dimensions == 3:
+            base = [slice(None), slice(None), slice(None)]
+        else:
+            raise ValueError(f"Unsupported latent dimensions: {latent_dimensions}")
+        base.extend(self._spatial_slices())
+        return tuple(base)
 
 def repeat_to_batch_size(tensor, batch_size, dim=0):
     if dim == 0 and tensor.shape[dim] == 1:
@@ -125,6 +483,7 @@ class AbstractDiffusion:
         self.num_tiles: int = None
         self.num_batches: int = None
         self.batched_bboxes: List[List[BBox]] = []
+        self.bboxes: List[BBox] = []
 
         # ext. Region Prompt Control (custom bbox)
         self.enable_custom_bbox: bool = False
@@ -151,6 +510,12 @@ class AbstractDiffusion:
         self.uniform_distribution = None
         self.sigmas = None
 
+        self.model_backend = "default"
+        self.backend_info: Dict[str, Union[int, Tuple[int, ...], float]] = {}
+        self.latent_dimensions = 2
+        self.latent_scale = None
+        self.latent_depth = 1
+
     def reset(self):
         tile_width = self.tile_width
         tile_height = self.tile_height
@@ -158,7 +523,7 @@ class AbstractDiffusion:
         tile_batch_size = self.tile_batch_size
         compression = self.compression
         width = self.width
-        height  = self.height 
+        height  = self.height
         overlap = self.overlap
         self.__init__()
         self.compression = compression
@@ -169,6 +534,109 @@ class AbstractDiffusion:
         self.tile_height = tile_height
         self.tile_overlap = tile_overlap
         self.tile_batch_size = tile_batch_size
+
+    def _latent_dimensions_from_tensor(self, tensor: Tensor) -> int:
+        dims = tensor.dim() - 2
+        if dims < 2:
+            raise ValueError(f"Unsupported latent rank for tiled diffusion: {tensor.shape}")
+        if dims > 3:
+            raise ValueError(f"Latent tensors with {dims} spatial dimensions are not supported")
+        return dims
+
+    def _bbox_slicer_for_tensor(self, bbox: BBox, tensor: Tensor):
+        return bbox.get_latent_slicer(self._latent_dimensions_from_tensor(tensor))
+
+    @staticmethod
+    def _align_weight_dims(weight, latent_dimensions: int, ref_tensor: Tensor = None) -> Tensor:
+        if not isinstance(weight, torch.Tensor):
+            weight = torch.as_tensor(weight, device=ref_tensor.device if ref_tensor is not None else devices.device)
+        elif ref_tensor is not None:
+            weight = weight.to(device=ref_tensor.device, dtype=ref_tensor.dtype)
+        expected_dim = 2 + latent_dimensions
+        while weight.dim() < expected_dim:
+            weight = weight.unsqueeze(0)
+        return weight
+
+    def _set_latent_shape(self, x_in: Tensor):
+        latent_dimensions = self._latent_dimensions_from_tensor(x_in)
+        self.latent_dimensions = latent_dimensions
+        if latent_dimensions == 2:
+            self.latent_depth = 1
+        else:
+            self.latent_depth = x_in.shape[2]
+        self.h = x_in.shape[-2]
+        self.w = x_in.shape[-1]
+
+    def configure_model(self, model: ModelPatcher):
+        base_model = getattr(model, "model", None)
+        if base_model is None:
+            return
+
+        latent_format = getattr(base_model, "latent_format", None)
+        if latent_format is not None:
+            self.latent_dimensions = getattr(latent_format, "latent_dimensions", self.latent_dimensions)
+            self.latent_scale = getattr(latent_format, "scale_factor", self.latent_scale)
+        diffusion_model = getattr(base_model, "diffusion_model", None)
+        if diffusion_model is None:
+            return
+
+        self.model_backend = "default"
+        self.backend_info = {}
+
+        module_name = diffusion_model.__class__.__module__
+        class_name = diffusion_model.__class__.__name__
+
+        if module_name.startswith("comfy.ldm.qwen_image") or "Qwen" in class_name:
+            self.model_backend = "qwen"
+            self.backend_info["patch_size"] = getattr(diffusion_model, "patch_size", 2)
+            _patch_qwen_tiled_diffusion()
+        elif module_name.startswith("comfy.ldm.wan") or "Wan" in class_name:
+            self.model_backend = "wan"
+            self.backend_info["patch_size"] = getattr(diffusion_model, "patch_size", (1, 2, 2))
+            _patch_wan_tiled_diffusion()
+        elif hasattr(diffusion_model, "patch_size"):
+            self.backend_info["patch_size"] = getattr(diffusion_model, "patch_size")
+
+    def supports_tiled_transformer_offsets(self) -> bool:
+        return self.model_backend in {"qwen", "wan"}
+
+    def build_transformer_offsets(self, bboxes: List[BBox], batch_size: int):
+        if not self.supports_tiled_transformer_offsets():
+            return None
+        offsets: List[Dict[str, Union[int, float]]] = []
+        for tile_index, bbox in enumerate(bboxes):
+            global_index = getattr(bbox, "global_index", tile_index)
+            tile_offset: Dict[str, Union[int, float]] = {
+                "offset_x": bbox.x,
+                "offset_y": bbox.y,
+                "index": global_index,
+            }
+            if self.model_backend == "wan":
+                tile_offset["offset_t"] = global_index
+            offsets.append(tile_offset)
+        if not offsets:
+            return None
+        global_info = {
+            "latent_height": self.h,
+            "latent_width": self.w,
+            "latent_depth": self.latent_depth,
+            "tile_batch_size": len(self.bboxes),
+            "batch_size": batch_size,
+        }
+        return {"offsets": offsets, "global": global_info}
+
+    def prepare_transformer_options(self, transformer_options, bboxes: List[BBox], batch_size: int):
+        if not self.supports_tiled_transformer_offsets():
+            return transformer_options
+        offsets = self.build_transformer_offsets(bboxes, batch_size)
+        if offsets is None:
+            return transformer_options
+        if transformer_options is None:
+            transformer_options = {}
+        else:
+            transformer_options = copy.deepcopy(transformer_options)
+        transformer_options["tiled_diffusion_offsets"] = offsets
+        return transformer_options
 
     def repeat_tensor(self, x:Tensor, n:int, concat=False, concat_to=0) -> Tensor:
         ''' repeat the tensor on it's first dim '''
@@ -216,11 +684,14 @@ class AbstractDiffusion:
         # split the latent into overlapped tiles, then batching
         # weights basically indicate how many times a pixel is painted
         bboxes, weights = split_bboxes(self.w, self.h, self.tile_w, self.tile_h, overlap, self.get_tile_weights())
+        self.bboxes = bboxes
+        for global_index, bbox in enumerate(self.bboxes):
+            bbox.global_index = global_index
         self.weights += weights
-        self.num_tiles = len(bboxes)
-        self.num_batches = ceildiv(self.num_tiles , tile_bs)
-        self.tile_bs = ceildiv(len(bboxes) , self.num_batches)          # optimal_batch_size
-        self.batched_bboxes = [bboxes[i*self.tile_bs:(i+1)*self.tile_bs] for i in range(self.num_batches)]
+        self.num_tiles = len(self.bboxes)
+        self.num_batches = 1 if self.num_tiles > 0 else 0
+        self.tile_bs = self.num_tiles
+        self.batched_bboxes = [self.bboxes] if self.num_tiles > 0 else []
 
     # detached version of above
     @grid_bbox
@@ -472,17 +943,20 @@ class MultiDiffusion(AbstractDiffusion):
         c_in: dict = args["c"]
         cond_or_uncond: List = args["cond_or_uncond"]
 
-        N, C, H, W = x_in.shape
+        prev_h, prev_w = self.h, self.w
+        prev_depth = self.latent_depth
+        self._set_latent_shape(x_in)
+        N = x_in.shape[0]
+        C = x_in.shape[1]
 
         # comfyui can feed in a latent that's a different size cause of SetArea, so we'll refresh in that case.
         self.refresh = False
-        if self.weights is None or self.h != H or self.w != W:
-            self.h, self.w = H, W
+        depth_changed = self.latent_dimensions == 3 and prev_depth != self.latent_depth
+        if self.weights is None or prev_h != self.h or prev_w != self.w or depth_changed:
             self.refresh = True
             self.init_grid_bbox(self.tile_width, self.tile_height, self.tile_overlap, self.tile_batch_size)
             # init everything done, perform sanity check & pre-computations
             self.init_done()
-        self.h, self.w = H, W
         # clear buffer canvas
         self.reset_buffer(x_in)
 
@@ -494,16 +968,18 @@ class MultiDiffusion(AbstractDiffusion):
                     return x_in
 
                 # batching & compute tiles
-                x_tile = torch.cat([x_in[bbox.slicer] for bbox in bboxes], dim=0)   # [TB, C, TH, TW]
+                x_tile = torch.cat([
+                    x_in[self._bbox_slicer_for_tensor(bbox, x_in)] for bbox in bboxes
+                ], dim=0)   # [TB, C, TH, TW]
                 t_tile = repeat_to_batch_size(t_in, x_tile.shape[0])
                 c_tile = {}
                 for k, v in c_in.items():
                     if isinstance(v, torch.Tensor):
                         if len(v.shape) == len(x_tile.shape):
-                            bboxes_ = bboxes
+                            bboxes_for_tensor: List[BBox]
                             if v.shape[-2:] != x_in.shape[-2:]:
                                 cf = x_in.shape[-1] * self.compression // v.shape[-1] # compression factor
-                                bboxes_ = self.get_grid_bbox(
+                                bboxes_chunks = self.get_grid_bbox(
                                     self.width // cf,
                                     self.height // cf,
                                     self.overlap // cf,
@@ -513,16 +989,29 @@ class MultiDiffusion(AbstractDiffusion):
                                     x_in.device,
                                     self.get_tile_weights,
                                 )
-                            v = torch.cat([v[bbox_.slicer] for bbox_ in bboxes_[batch_id]])
+                                bboxes_for_tensor = [bbox_ for chunk in bboxes_chunks for bbox_ in chunk]
+                            else:
+                                bboxes_for_tensor = list(self.bboxes)
+                            v = torch.cat([
+                                v[self._bbox_slicer_for_tensor(bbox_, v)] for bbox_ in bboxes_for_tensor
+                            ])
                         if v.shape[0] != x_tile.shape[0]:
                             v = repeat_to_batch_size(v, x_tile.shape[0])
+                    elif k == "transformer_options" and isinstance(v, dict):
+                        v = copy.deepcopy(v)
                     c_tile[k] = v
+
+                transformer_options = c_tile.get("transformer_options", None)
+                transformer_options = self.prepare_transformer_options(transformer_options, self.bboxes, N)
+                if transformer_options is not None:
+                    c_tile["transformer_options"] = transformer_options
 
                 # controlnet tiling
                 # self.switch_controlnet_tensors(batch_id, N, len(bboxes))
                 if 'control' in c_in:
                     self.process_controlnet(x_tile, c_in, cond_or_uncond, bboxes, N, batch_id)
-                    c_tile['control'] = c_in['control'].get_control_orig(x_tile, t_tile, c_tile, len(cond_or_uncond), c_in['transformer_options'])
+                    control_transformer_options = c_tile.get('transformer_options', c_in.get('transformer_options'))
+                    c_tile['control'] = c_in['control'].get_control_orig(x_tile, t_tile, c_tile, len(cond_or_uncond), control_transformer_options)
 
                 # stablesr tiling
                 # self.switch_stablesr_tensors(batch_id)
@@ -530,7 +1019,7 @@ class MultiDiffusion(AbstractDiffusion):
                 x_tile_out = model_function(x_tile, t_tile, **c_tile)
 
                 for i, bbox in enumerate(bboxes):
-                    self.x_buffer[bbox.slicer] += x_tile_out[i*N:(i+1)*N, :, :, :]
+                    self.x_buffer[self._bbox_slicer_for_tensor(bbox, self.x_buffer)] += x_tile_out[i*N:(i+1)*N, ...]
                 del x_tile_out, x_tile, t_tile, c_tile
 
                 # update progress bar
@@ -579,17 +1068,20 @@ class SpotDiffusion(AbstractDiffusion):
         c_in: dict = args["c"]
         cond_or_uncond: List = args["cond_or_uncond"]
 
-        N, C, H, W = x_in.shape
+        prev_h, prev_w = self.h, self.w
+        prev_depth = self.latent_depth
+        self._set_latent_shape(x_in)
+        N = x_in.shape[0]
+        C = x_in.shape[1]
 
         # comfyui can feed in a latent that's a different size cause of SetArea, so we'll refresh in that case.
         self.refresh = False
-        if self.weights is None or self.h != H or self.w != W:
-            self.h, self.w = H, W
+        depth_changed = self.latent_dimensions == 3 and prev_depth != self.latent_depth
+        if self.weights is None or prev_h != self.h or prev_w != self.w or depth_changed:
             self.refresh = True
             self.init_grid_bbox(self.tile_width, self.tile_height, self.tile_overlap, self.tile_batch_size)
             # init everything done, perform sanity check & pre-computations
             self.init_done()
-        self.h, self.w = H, W
         # clear buffer canvas
         self.reset_buffer(x_in)
 
@@ -645,17 +1137,18 @@ class SpotDiffusion(AbstractDiffusion):
                     return x_in
 
                 # batching & compute tiles
-                x_tile = torch.cat([x_in[bbox.slicer] for bbox in bboxes], dim=0)   # [TB, C, TH, TW]
+                x_tile = torch.cat([
+                    x_in[self._bbox_slicer_for_tensor(bbox, x_in)] for bbox in bboxes
+                ], dim=0)   # [TB, C, TH, TW]
                 t_tile = repeat_to_batch_size(t_in, x_tile.shape[0])
                 c_tile = {}
                 for k, v in c_in.items():
                     if isinstance(v, torch.Tensor):
                         if len(v.shape) == len(x_tile.shape):
-                            bboxes_ = bboxes
                             sh_h_new, sh_w_new = sh_h, sh_w
                             if v.shape[-2:] != x_in.shape[-2:]:
                                 cf = x_in.shape[-1] * self.compression // v.shape[-1] # compression factor
-                                bboxes_ = self.get_grid_bbox(
+                                bboxes_chunks = self.get_grid_bbox(
                                     self.width // cf,
                                     self.height // cf,
                                     self.overlap // cf,
@@ -665,18 +1158,32 @@ class SpotDiffusion(AbstractDiffusion):
                                     x_in.device,
                                     self.get_tile_weights,
                                 )
-                                sh_h_new, sh_w_new = round(sh_h * self.compression / cf), round(sh_w * self.compression / cf)
+                                bboxes_for_tensor = [bbox_ for chunk in bboxes_chunks for bbox_ in chunk]
+                                sh_h_new = round(sh_h * self.compression / cf)
+                                sh_w_new = round(sh_w * self.compression / cf)
+                            else:
+                                bboxes_for_tensor = list(self.bboxes)
                             v = v.roll(shifts=(sh_h_new, sh_w_new), dims=(-2,-1))
-                            v = torch.cat([v[bbox_.slicer] for bbox_ in bboxes_[batch_id]])
+                            v = torch.cat([
+                                v[self._bbox_slicer_for_tensor(bbox_, v)] for bbox_ in bboxes_for_tensor
+                            ])
                         if v.shape[0] != x_tile.shape[0]:
                             v = repeat_to_batch_size(v, x_tile.shape[0])
+                    elif k == "transformer_options" and isinstance(v, dict):
+                        v = copy.deepcopy(v)
                     c_tile[k] = v
+
+                transformer_options = c_tile.get("transformer_options", None)
+                transformer_options = self.prepare_transformer_options(transformer_options, self.bboxes, N)
+                if transformer_options is not None:
+                    c_tile["transformer_options"] = transformer_options
 
                 # controlnet tiling
                 # self.switch_controlnet_tensors(batch_id, N, len(bboxes))
                 if 'control' in c_in:
                     self.process_controlnet(x_tile, c_in, cond_or_uncond, bboxes, N, batch_id, (sh_h,sh_w), condition)
-                    c_tile['control'] = c_in['control'].get_control_orig(x_tile, t_tile, c_tile, len(cond_or_uncond), c_in['transformer_options'])
+                    control_transformer_options = c_tile.get('transformer_options', c_in.get('transformer_options'))
+                    c_tile['control'] = c_in['control'].get_control_orig(x_tile, t_tile, c_tile, len(cond_or_uncond), control_transformer_options)
 
                 # stablesr tiling
                 # self.switch_stablesr_tensors(batch_id)
@@ -684,7 +1191,7 @@ class SpotDiffusion(AbstractDiffusion):
                 x_tile_out = model_function(x_tile, t_tile, **c_tile)
 
                 for i, bbox in enumerate(bboxes):
-                    self.x_buffer[bbox.slicer] = x_tile_out[i*N:(i+1)*N, :, :, :]
+                    self.x_buffer[self._bbox_slicer_for_tensor(bbox, self.x_buffer)] = x_tile_out[i*N:(i+1)*N, ...]
 
                 del x_tile_out, x_tile, t_tile, c_tile
 
@@ -740,17 +1247,19 @@ class MixtureOfDiffusers(AbstractDiffusion):
         c_in: dict = args["c"]
         cond_or_uncond: List= args["cond_or_uncond"]
 
-        N, C, H, W = x_in.shape
+        prev_h, prev_w = self.h, self.w
+        prev_depth = self.latent_depth
+        self._set_latent_shape(x_in)
+        N = x_in.shape[0]
+        C = x_in.shape[1]
 
         self.refresh = False
-        # self.refresh = True
-        if self.weights is None or self.h != H or self.w != W:
-            self.h, self.w = H, W
+        depth_changed = self.latent_dimensions == 3 and prev_depth != self.latent_depth
+        if self.weights is None or prev_h != self.h or prev_w != self.w or depth_changed:
             self.refresh = True
             self.init_grid_bbox(self.tile_width, self.tile_height, self.tile_overlap, self.tile_batch_size)
             # init everything done, perform sanity check & pre-computations
             self.init_done()
-        self.h, self.w = H, W
         # clear buffer canvas
         self.reset_buffer(x_in)
 
@@ -766,7 +1275,7 @@ class MixtureOfDiffusers(AbstractDiffusion):
                 # batching
                 x_tile_list     = []
                 for bbox in bboxes:
-                    x_tile_list.append(x_in[bbox.slicer])
+                    x_tile_list.append(x_in[self._bbox_slicer_for_tensor(bbox, x_in)])
 
                 x_tile = torch.cat(x_tile_list, dim=0)                     # differs each
                 t_tile = repeat_to_batch_size(t_in, x_tile.shape[0])   # just repeat
@@ -774,10 +1283,9 @@ class MixtureOfDiffusers(AbstractDiffusion):
                 for k, v in c_in.items():
                     if isinstance(v, torch.Tensor):
                         if len(v.shape) == len(x_tile.shape):
-                            bboxes_ = bboxes
                             if v.shape[-2:] != x_in.shape[-2:]:
                                 cf = x_in.shape[-1] * self.compression // v.shape[-1] # compression factor
-                                bboxes_ = self.get_grid_bbox(
+                                bboxes_chunks = self.get_grid_bbox(
                                     (tile_w := self.width // cf),
                                     (tile_h := self.height // cf),
                                     self.overlap // cf,
@@ -787,16 +1295,29 @@ class MixtureOfDiffusers(AbstractDiffusion):
                                     x_in.device,
                                     lambda: self.get_weight(tile_w, tile_h),
                                 )
-                            v = torch.cat([v[bbox_.slicer] for bbox_ in bboxes_[batch_id]])
+                                bboxes_for_tensor = [bbox_ for chunk in bboxes_chunks for bbox_ in chunk]
+                            else:
+                                bboxes_for_tensor = list(self.bboxes)
+                            v = torch.cat([
+                                v[self._bbox_slicer_for_tensor(bbox_, v)] for bbox_ in bboxes_for_tensor
+                            ])
                         if v.shape[0] != x_tile.shape[0]:
                             v = repeat_to_batch_size(v, x_tile.shape[0])
+                    elif k == "transformer_options" and isinstance(v, dict):
+                        v = copy.deepcopy(v)
                     c_tile[k] = v
-                
+
+                transformer_options = c_tile.get("transformer_options", None)
+                transformer_options = self.prepare_transformer_options(transformer_options, self.bboxes, N)
+                if transformer_options is not None:
+                    c_tile["transformer_options"] = transformer_options
+
                 # controlnet
                 # self.switch_controlnet_tensors(batch_id, N, len(bboxes), is_denoise=True)
                 if 'control' in c_in:
                     self.process_controlnet(x_tile, c_in, cond_or_uncond, bboxes, N, batch_id)
-                    c_tile['control'] = c_in['control'].get_control_orig(x_tile, t_tile, c_tile, len(cond_or_uncond), c_in['transformer_options'])
+                    control_transformer_options = c_tile.get('transformer_options', c_in.get('transformer_options'))
+                    c_tile['control'] = c_in['control'].get_control_orig(x_tile, t_tile, c_tile, len(cond_or_uncond), control_transformer_options)
                 
                 # stablesr
                 # self.switch_stablesr_tensors(batch_id)
@@ -808,8 +1329,10 @@ class MixtureOfDiffusers(AbstractDiffusion):
                 for i, bbox in enumerate(bboxes):
                     # These weights can be calcluated in advance, but will cost a lot of vram 
                     # when you have many tiles. So we calculate it here.
-                    w = self.tile_weights * self.rescale_factor[bbox.slicer]
-                    self.x_buffer[bbox.slicer] += x_tile_out[i*N:(i+1)*N, :, :, :] * w
+                    rescale = self._align_weight_dims(self.rescale_factor[bbox.slicer], self.latent_dimensions)
+                    weights = self._align_weight_dims(self.tile_weights, self.latent_dimensions, ref_tensor=rescale)
+                    w = weights * rescale
+                    self.x_buffer[self._bbox_slicer_for_tensor(bbox, self.x_buffer)] += x_tile_out[i*N:(i+1)*N, ...] * w
                 del x_tile_out, x_tile, t_tile, c_tile
 
                 # self.update_pbar()
@@ -876,6 +1399,7 @@ class TiledDiffusion():
         # hijack the behaviours
         # self.impl.hook()
         model = model.clone()
+        self.impl.configure_model(model)
         model.set_model_unet_function_wrapper(self.impl)
         model.model_options['tiled_diffusion'] = True
         return (model,)
