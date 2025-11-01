@@ -1,3 +1,4 @@
+import copy
 import torch
 from torch import Tensor
 from typing import List, Union, Tuple, Callable, Dict
@@ -10,6 +11,7 @@ from comfy.model_base import BaseModel
 from comfy.model_patcher import ModelPatcher
 from comfy.controlnet import ControlNet, T2IAdapter
 from comfy.utils import common_upscale
+import comfy.ldm.common_dit
 from comfy.model_management import processing_interrupted, loaded_models, load_models_gpu
 from math import pi
 
@@ -41,6 +43,315 @@ stablesr       = null_decorator
 grid_bbox      = null_decorator
 custom_bbox    = null_decorator
 noise_inverse  = null_decorator
+
+_qwen_tiled_diffusion_patched = False
+_wan_tiled_diffusion_patched = False
+
+
+def _patch_qwen_tiled_diffusion():
+    global _qwen_tiled_diffusion_patched
+    if _qwen_tiled_diffusion_patched:
+        return
+    try:
+        from comfy.ldm.qwen_image.model import QwenImageTransformer2DModel  # type: ignore
+    except Exception:
+        return
+
+    original_forward = QwenImageTransformer2DModel._forward
+
+    def tiled_forward(
+        self,
+        x,
+        timesteps,
+        context,
+        attention_mask=None,
+        guidance: torch.Tensor = None,
+        ref_latents=None,
+        transformer_options={},
+        control=None,
+        **kwargs,
+    ):
+        offsets_info = transformer_options.get("tiled_diffusion_offsets")
+        if not offsets_info:
+            return original_forward(
+                self,
+                x,
+                timesteps,
+                context,
+                attention_mask=attention_mask,
+                guidance=guidance,
+                ref_latents=ref_latents,
+                transformer_options=transformer_options,
+                control=control,
+                **kwargs,
+            )
+
+        timestep = timesteps
+        encoder_hidden_states = context
+        encoder_hidden_states_mask = attention_mask
+
+        hidden_states, img_ids, orig_shape = self.process_img(x)
+        num_embeds = hidden_states.shape[1]
+
+        offsets = offsets_info.get("offsets", [])
+        global_info = offsets_info.get("global", {})
+        patch_size = getattr(self, "patch_size", 2)
+        tile_h_len = ((orig_shape[-2] + (patch_size // 2)) // patch_size)
+        tile_w_len = ((orig_shape[-1] + (patch_size // 2)) // patch_size)
+        full_h = global_info.get("latent_height", orig_shape[-2])
+        full_w = global_info.get("latent_width", orig_shape[-1])
+        full_h_len = ((full_h + (patch_size // 2)) // patch_size)
+        full_w_len = ((full_w + (patch_size // 2)) // patch_size)
+
+        img_ids = img_ids.view(img_ids.shape[0], tile_h_len, tile_w_len, img_ids.shape[-1])
+        batch = img_ids.shape[0]
+        if len(offsets) not in (0, batch):
+            if len(offsets) == 1:
+                offsets = offsets * batch
+            else:
+                raise ValueError("Unexpected tiled diffusion offset count for Qwen batch")
+        if len(offsets) == 0:
+            offsets = [{"offset_x": 0, "offset_y": 0, "index": 0}] * batch
+
+        for i in range(batch):
+            off = offsets[i]
+            index = off.get("index", 0)
+            h_offset = off.get("offset_y", 0)
+            w_offset = off.get("offset_x", 0)
+            h_start = (h_offset + (patch_size // 2)) // patch_size
+            w_start = (w_offset + (patch_size // 2)) // patch_size
+            img_ids[i, :, :, 0] = torch.as_tensor(index, dtype=img_ids.dtype, device=img_ids.device)
+            img_ids[i, :, :, 1] = (
+                torch.linspace(
+                    h_start,
+                    h_start + tile_h_len - 1,
+                    steps=tile_h_len,
+                    device=img_ids.device,
+                    dtype=img_ids.dtype,
+                ).unsqueeze(1)
+                - float(full_h_len // 2)
+            )
+            img_ids[i, :, :, 2] = (
+                torch.linspace(
+                    w_start,
+                    w_start + tile_w_len - 1,
+                    steps=tile_w_len,
+                    device=img_ids.device,
+                    dtype=img_ids.dtype,
+                ).unsqueeze(0)
+                - float(full_w_len // 2)
+            )
+
+        img_ids = img_ids.view(batch, -1, img_ids.shape[-1])
+
+        if ref_latents is not None:
+            h = 0
+            w = 0
+            index = 0
+            index_ref_method = kwargs.get("ref_latents_method", "index") == "index"
+            for ref in ref_latents:
+                if index_ref_method:
+                    index += 1
+                    h_offset = 0
+                    w_offset = 0
+                else:
+                    index = 1
+                    h_offset = 0
+                    w_offset = 0
+                    if ref.shape[-2] + h > ref.shape[-1] + w:
+                        w_offset = w
+                    else:
+                        h_offset = h
+                    h = max(h, ref.shape[-2] + h_offset)
+                    w = max(w, ref.shape[-1] + w_offset)
+
+                kontext, kontext_ids, _ = self.process_img(ref, index=index, h_offset=h_offset, w_offset=w_offset)
+                hidden_states = torch.cat([hidden_states, kontext], dim=1)
+                img_ids = torch.cat([img_ids, kontext_ids], dim=1)
+
+        txt_start = round(
+            max(
+                ((x.shape[-1] + (self.patch_size // 2)) // self.patch_size) // 2,
+                ((x.shape[-2] + (self.patch_size // 2)) // self.patch_size) // 2,
+            )
+        )
+        txt_ids = (
+            torch.arange(txt_start, txt_start + context.shape[1], device=x.device)
+            .reshape(1, -1, 1)
+            .repeat(x.shape[0], 1, 3)
+        )
+        ids = torch.cat((txt_ids, img_ids), dim=1)
+        image_rotary_emb = self.pe_embedder(ids).squeeze(1).unsqueeze(2).to(x.dtype)
+        del ids, txt_ids, img_ids
+
+        hidden_states = self.img_in(hidden_states)
+        encoder_hidden_states = self.txt_norm(encoder_hidden_states)
+        encoder_hidden_states = self.txt_in(encoder_hidden_states)
+
+        if guidance is not None:
+            guidance = guidance * 1000
+
+        temb = (
+            self.time_text_embed(timestep, hidden_states)
+            if guidance is None
+            else self.time_text_embed(timestep, guidance, hidden_states)
+        )
+
+        patches_replace = transformer_options.get("patches_replace", {})
+        patches = transformer_options.get("patches", {})
+        blocks_replace = patches_replace.get("dit", {})
+
+        for i, block in enumerate(self.transformer_blocks):
+            if ("double_block", i) in blocks_replace:
+                def block_wrap(args):
+                    out = {}
+                    out["txt"], out["img"] = block(
+                        hidden_states=args["img"],
+                        encoder_hidden_states=args["txt"],
+                        encoder_hidden_states_mask=encoder_hidden_states_mask,
+                        temb=args["vec"],
+                        image_rotary_emb=args["pe"],
+                        transformer_options=args["transformer_options"],
+                    )
+                    return out
+
+                out = blocks_replace[("double_block", i)](
+                    {"img": hidden_states, "txt": encoder_hidden_states, "vec": temb, "pe": image_rotary_emb, "transformer_options": transformer_options},
+                    {"original_block": block_wrap},
+                )
+                hidden_states = out["img"]
+                encoder_hidden_states = out["txt"]
+            else:
+                encoder_hidden_states, hidden_states = block(
+                    hidden_states=hidden_states,
+                    encoder_hidden_states=encoder_hidden_states,
+                    encoder_hidden_states_mask=encoder_hidden_states_mask,
+                    temb=temb,
+                    image_rotary_emb=image_rotary_emb,
+                    transformer_options=transformer_options,
+                )
+
+            if "double_block" in patches:
+                for p in patches["double_block"]:
+                    out = p(
+                        {"img": hidden_states, "txt": encoder_hidden_states, "x": x, "block_index": i, "transformer_options": transformer_options}
+                    )
+                    hidden_states = out["img"]
+                    encoder_hidden_states = out["txt"]
+
+            if control is not None:  # Controlnet
+                control_i = control.get("input")
+                if i < len(control_i):
+                    add = control_i[i]
+                    if add is not None:
+                        hidden_states[:, : add.shape[1]] += add
+
+        hidden_states = self.norm_out(hidden_states, temb)
+        hidden_states = self.proj_out(hidden_states)
+
+        hidden_states = hidden_states[:, :num_embeds].view(
+            orig_shape[0], orig_shape[-2] // 2, orig_shape[-1] // 2, orig_shape[1], 2, 2
+        )
+        hidden_states = hidden_states.permute(0, 3, 1, 4, 2, 5)
+        return hidden_states.reshape(orig_shape)[:, :, :, : x.shape[-2], : x.shape[-1]]
+
+    QwenImageTransformer2DModel._forward = tiled_forward
+    _qwen_tiled_diffusion_patched = True
+
+
+def _patch_wan_tiled_diffusion():
+    global _wan_tiled_diffusion_patched
+    if _wan_tiled_diffusion_patched:
+        return
+    try:
+        from comfy.ldm.wan.model import WanModel  # type: ignore
+    except Exception:
+        return
+
+    original_forward = WanModel._forward
+
+    def tiled_forward(
+        self,
+        x,
+        timestep,
+        context,
+        clip_fea=None,
+        time_dim_concat=None,
+        transformer_options={},
+        **kwargs,
+    ):
+        offsets_info = transformer_options.get("tiled_diffusion_offsets")
+
+        bs, c, t, h, w = x.shape
+        x = comfy.ldm.common_dit.pad_to_patch_size(x, self.patch_size)
+
+        t_len = t
+        if time_dim_concat is not None:
+            time_dim_concat = comfy.ldm.common_dit.pad_to_patch_size(time_dim_concat, self.patch_size)
+            x = torch.cat([x, time_dim_concat], dim=2)
+            t_len = x.shape[2]
+
+        if self.ref_conv is not None and "reference_latent" in kwargs:
+            t_len += 1
+
+        if not offsets_info:
+            freqs = self.rope_encode(
+                t_len,
+                h,
+                w,
+                device=x.device,
+                dtype=x.dtype,
+                transformer_options=transformer_options,
+            )
+        else:
+            offsets = offsets_info.get("offsets", [])
+            patch_size = getattr(self, "patch_size", (1, 2, 2))
+            rope_base = transformer_options.get("rope_options", None)
+            if len(offsets) not in (0, bs):
+                if len(offsets) == 1:
+                    offsets = offsets * bs
+                else:
+                    raise ValueError("Unexpected tiled diffusion offset count for Wan batch")
+            if len(offsets) == 0:
+                offsets = [{"offset_x": 0, "offset_y": 0, "offset_t": 0}] * bs
+
+            freqs_list = []
+            for off in offsets:
+                local_rope = {} if rope_base is None else rope_base.copy()
+                t_start = 0
+                if patch_size[0] != 0:
+                    t_start = (off.get("offset_t", 0) + (patch_size[0] // 2)) // patch_size[0]
+                h_start = (off.get("offset_y", 0) + (patch_size[1] // 2)) // patch_size[1]
+                w_start = (off.get("offset_x", 0) + (patch_size[2] // 2)) // patch_size[2]
+                local_rope["shift_t"] = local_rope.get("shift_t", 0.0) + float(t_start)
+                local_rope["shift_y"] = local_rope.get("shift_y", 0.0) + float(h_start)
+                local_rope["shift_x"] = local_rope.get("shift_x", 0.0) + float(w_start)
+                local_transformer_options = transformer_options.copy()
+                local_transformer_options["rope_options"] = local_rope
+                freqs_list.append(
+                    self.rope_encode(
+                        t_len,
+                        h,
+                        w,
+                        device=x.device,
+                        dtype=x.dtype,
+                        transformer_options=local_transformer_options,
+                    )
+                )
+            freqs = torch.cat(freqs_list, dim=0)
+
+        return self.forward_orig(
+            x,
+            timestep,
+            context,
+            clip_fea=clip_fea,
+            freqs=freqs,
+            transformer_options=transformer_options,
+            **kwargs,
+        )[:, :, :t, :h, :w]
+
+    WanModel._forward = tiled_forward
+    _wan_tiled_diffusion_patched = True
 
 class BBox:
     ''' grid bbox '''
@@ -151,6 +462,12 @@ class AbstractDiffusion:
         self.uniform_distribution = None
         self.sigmas = None
 
+        self.model_backend = "default"
+        self.backend_info: Dict[str, Union[int, Tuple[int, ...], float]] = {}
+        self.latent_dimensions = 2
+        self.latent_scale = None
+        self.latent_depth = 1
+
     def reset(self):
         tile_width = self.tile_width
         tile_height = self.tile_height
@@ -158,7 +475,7 @@ class AbstractDiffusion:
         tile_batch_size = self.tile_batch_size
         compression = self.compression
         width = self.width
-        height  = self.height 
+        height  = self.height
         overlap = self.overlap
         self.__init__()
         self.compression = compression
@@ -169,6 +486,74 @@ class AbstractDiffusion:
         self.tile_height = tile_height
         self.tile_overlap = tile_overlap
         self.tile_batch_size = tile_batch_size
+
+    def configure_model(self, model: ModelPatcher):
+        base_model = getattr(model, "model", None)
+        if base_model is None:
+            return
+
+        latent_format = getattr(base_model, "latent_format", None)
+        if latent_format is not None:
+            self.latent_dimensions = getattr(latent_format, "latent_dimensions", self.latent_dimensions)
+            self.latent_scale = getattr(latent_format, "scale_factor", self.latent_scale)
+        diffusion_model = getattr(base_model, "diffusion_model", None)
+        if diffusion_model is None:
+            return
+
+        self.model_backend = "default"
+        self.backend_info = {}
+
+        module_name = diffusion_model.__class__.__module__
+        class_name = diffusion_model.__class__.__name__
+
+        if module_name.startswith("comfy.ldm.qwen_image") or "Qwen" in class_name:
+            self.model_backend = "qwen"
+            self.backend_info["patch_size"] = getattr(diffusion_model, "patch_size", 2)
+            _patch_qwen_tiled_diffusion()
+        elif module_name.startswith("comfy.ldm.wan") or "Wan" in class_name:
+            self.model_backend = "wan"
+            self.backend_info["patch_size"] = getattr(diffusion_model, "patch_size", (1, 2, 2))
+            _patch_wan_tiled_diffusion()
+        elif hasattr(diffusion_model, "patch_size"):
+            self.backend_info["patch_size"] = getattr(diffusion_model, "patch_size")
+
+    def supports_tiled_transformer_offsets(self) -> bool:
+        return self.model_backend in {"qwen", "wan"}
+
+    def build_transformer_offsets(self, bboxes: List[BBox], batch_size: int):
+        if not self.supports_tiled_transformer_offsets():
+            return None
+        offsets: List[Dict[str, Union[int, float]]] = []
+        for bbox in bboxes:
+            base_offset: Dict[str, Union[int, float]] = {
+                "offset_x": bbox.x,
+                "offset_y": bbox.y,
+            }
+            if self.model_backend == "wan":
+                base_offset["offset_t"] = 0
+            for _ in range(batch_size):
+                offsets.append(base_offset.copy())
+        if not offsets:
+            return None
+        global_info = {
+            "latent_height": self.h,
+            "latent_width": self.w,
+            "latent_depth": self.latent_depth,
+        }
+        return {"offsets": offsets, "global": global_info}
+
+    def prepare_transformer_options(self, transformer_options, bboxes: List[BBox], batch_size: int):
+        if not self.supports_tiled_transformer_offsets():
+            return transformer_options
+        offsets = self.build_transformer_offsets(bboxes, batch_size)
+        if offsets is None:
+            return transformer_options
+        if transformer_options is None:
+            transformer_options = {}
+        else:
+            transformer_options = copy.deepcopy(transformer_options)
+        transformer_options["tiled_diffusion_offsets"] = offsets
+        return transformer_options
 
     def repeat_tensor(self, x:Tensor, n:int, concat=False, concat_to=0) -> Tensor:
         ''' repeat the tensor on it's first dim '''
@@ -516,13 +901,21 @@ class MultiDiffusion(AbstractDiffusion):
                             v = torch.cat([v[bbox_.slicer] for bbox_ in bboxes_[batch_id]])
                         if v.shape[0] != x_tile.shape[0]:
                             v = repeat_to_batch_size(v, x_tile.shape[0])
+                    elif k == "transformer_options" and isinstance(v, dict):
+                        v = copy.deepcopy(v)
                     c_tile[k] = v
+
+                transformer_options = c_tile.get("transformer_options", None)
+                transformer_options = self.prepare_transformer_options(transformer_options, bboxes, N)
+                if transformer_options is not None:
+                    c_tile["transformer_options"] = transformer_options
 
                 # controlnet tiling
                 # self.switch_controlnet_tensors(batch_id, N, len(bboxes))
                 if 'control' in c_in:
                     self.process_controlnet(x_tile, c_in, cond_or_uncond, bboxes, N, batch_id)
-                    c_tile['control'] = c_in['control'].get_control_orig(x_tile, t_tile, c_tile, len(cond_or_uncond), c_in['transformer_options'])
+                    control_transformer_options = c_tile.get('transformer_options', c_in.get('transformer_options'))
+                    c_tile['control'] = c_in['control'].get_control_orig(x_tile, t_tile, c_tile, len(cond_or_uncond), control_transformer_options)
 
                 # stablesr tiling
                 # self.switch_stablesr_tensors(batch_id)
@@ -670,13 +1063,21 @@ class SpotDiffusion(AbstractDiffusion):
                             v = torch.cat([v[bbox_.slicer] for bbox_ in bboxes_[batch_id]])
                         if v.shape[0] != x_tile.shape[0]:
                             v = repeat_to_batch_size(v, x_tile.shape[0])
+                    elif k == "transformer_options" and isinstance(v, dict):
+                        v = copy.deepcopy(v)
                     c_tile[k] = v
+
+                transformer_options = c_tile.get("transformer_options", None)
+                transformer_options = self.prepare_transformer_options(transformer_options, bboxes, N)
+                if transformer_options is not None:
+                    c_tile["transformer_options"] = transformer_options
 
                 # controlnet tiling
                 # self.switch_controlnet_tensors(batch_id, N, len(bboxes))
                 if 'control' in c_in:
                     self.process_controlnet(x_tile, c_in, cond_or_uncond, bboxes, N, batch_id, (sh_h,sh_w), condition)
-                    c_tile['control'] = c_in['control'].get_control_orig(x_tile, t_tile, c_tile, len(cond_or_uncond), c_in['transformer_options'])
+                    control_transformer_options = c_tile.get('transformer_options', c_in.get('transformer_options'))
+                    c_tile['control'] = c_in['control'].get_control_orig(x_tile, t_tile, c_tile, len(cond_or_uncond), control_transformer_options)
 
                 # stablesr tiling
                 # self.switch_stablesr_tensors(batch_id)
@@ -790,13 +1191,21 @@ class MixtureOfDiffusers(AbstractDiffusion):
                             v = torch.cat([v[bbox_.slicer] for bbox_ in bboxes_[batch_id]])
                         if v.shape[0] != x_tile.shape[0]:
                             v = repeat_to_batch_size(v, x_tile.shape[0])
+                    elif k == "transformer_options" and isinstance(v, dict):
+                        v = copy.deepcopy(v)
                     c_tile[k] = v
-                
+
+                transformer_options = c_tile.get("transformer_options", None)
+                transformer_options = self.prepare_transformer_options(transformer_options, bboxes, N)
+                if transformer_options is not None:
+                    c_tile["transformer_options"] = transformer_options
+
                 # controlnet
                 # self.switch_controlnet_tensors(batch_id, N, len(bboxes), is_denoise=True)
                 if 'control' in c_in:
                     self.process_controlnet(x_tile, c_in, cond_or_uncond, bboxes, N, batch_id)
-                    c_tile['control'] = c_in['control'].get_control_orig(x_tile, t_tile, c_tile, len(cond_or_uncond), c_in['transformer_options'])
+                    control_transformer_options = c_tile.get('transformer_options', c_in.get('transformer_options'))
+                    c_tile['control'] = c_in['control'].get_control_orig(x_tile, t_tile, c_tile, len(cond_or_uncond), control_transformer_options)
                 
                 # stablesr
                 # self.switch_stablesr_tensors(batch_id)
@@ -876,6 +1285,7 @@ class TiledDiffusion():
         # hijack the behaviours
         # self.impl.hook()
         model = model.clone()
+        self.impl.configure_model(model)
         model.set_model_unet_function_wrapper(self.impl)
         model.model_options['tiled_diffusion'] = True
         return (model,)
