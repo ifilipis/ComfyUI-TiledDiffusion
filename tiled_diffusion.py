@@ -1,6 +1,6 @@
 import torch
 from torch import Tensor
-from typing import List, Union, Tuple, Callable, Dict
+from typing import List, Union, Tuple, Callable, Dict, Optional
 from weakref import WeakSet
 import comfy.utils
 import comfy.model_patcher
@@ -12,6 +12,7 @@ from comfy.controlnet import ControlNet, T2IAdapter
 from comfy.utils import common_upscale
 from comfy.model_management import processing_interrupted, loaded_models, load_models_gpu
 from math import pi
+from types import MethodType
 
 opt_C = 4
 opt_f = 8
@@ -64,6 +65,229 @@ def repeat_to_batch_size(tensor, batch_size, dim=0):
     elif tensor.shape[dim] < batch_size:
         return tensor.repeat(dim * [1] + [ceildiv(batch_size, tensor.shape[dim])] + [1] * (len(tensor.shape) - 1 - dim)).narrow(dim, 0, batch_size)
     return tensor
+
+try:
+    from comfy.ldm.qwen_image.model import QwenImageTransformer2DModel
+except Exception:
+    QwenImageTransformer2DModel = None
+
+try:
+    from comfy.ldm.wan.model import WanModel
+except Exception:
+    WanModel = None
+
+
+def _extend_infos(infos: List[Dict], target: int) -> List[Dict]:
+    if target <= 0:
+        return []
+    if len(infos) >= target:
+        return [dict(infos[i]) for i in range(target)]
+    if not infos:
+        base = {"h": 0, "w": 0, "t": 0}
+        return [dict(base) for _ in range(target)]
+    padded = [dict(info) for info in infos]
+    last = dict(padded[-1])
+    padded.extend(dict(last) for _ in range(target - len(padded)))
+    return padded
+
+
+def _tile_infos_for_batch(bboxes: List['BBox'], total: int, extra: Optional[Dict] = None) -> List[Dict]:
+    if total <= 0:
+        return []
+    extra = extra or {}
+    if not bboxes:
+        base = {"h": 0, "w": 0, "t": 0}
+        base.update(extra)
+        return [dict(base) for _ in range(total)]
+    per_tile = ceildiv(total, len(bboxes))
+    infos: List[Dict] = []
+    for bbox in bboxes:
+        base_info = {"h": bbox.y, "w": bbox.x, "t": 0}
+        base_info.update(extra)
+        for _ in range(per_tile):
+            infos.append(dict(base_info))
+    return _extend_infos(infos, total)
+
+
+def _compute_patch_offset(value: int, patch_size: int) -> int:
+    if patch_size <= 0:
+        return value
+    return (value + (patch_size // 2)) // patch_size
+
+
+def _patch_qwen_process_img(model):
+    if getattr(model, "_tiled_diffusion_qwen_patched", False):
+        return
+
+    orig_process_img = model.process_img
+
+    def process_img_with_tiles(self, x, index=0, h_offset=0, w_offset=0):
+        tile_infos = getattr(self, "_tile_infos", None)
+        hidden_states, img_ids, orig_shape = orig_process_img(x, index=index, h_offset=h_offset, w_offset=w_offset)
+        if tile_infos is None or len(tile_infos) == 0:
+            return hidden_states, img_ids, orig_shape
+
+        bs = hidden_states.shape[0]
+        infos = _extend_infos(tile_infos, bs)
+        patch = getattr(self, "patch_size", 1)
+        if not isinstance(patch, int):
+            patch = int(patch)
+        patch = max(patch, 1)
+
+        offsets_h = torch.tensor([_compute_patch_offset(info.get("h", 0), patch) for info in infos], device=img_ids.device, dtype=img_ids.dtype)
+        offsets_w = torch.tensor([_compute_patch_offset(info.get("w", 0), patch) for info in infos], device=img_ids.device, dtype=img_ids.dtype)
+
+        h_tokens = max(1, orig_shape[-2] // 2)
+        w_tokens = max(1, orig_shape[-1] // 2)
+        img_ids = img_ids.view(bs, h_tokens, w_tokens, 3).clone()
+        img_ids[:, :, :, 1] += offsets_h.view(bs, 1, 1)
+        img_ids[:, :, :, 2] += offsets_w.view(bs, 1, 1)
+        img_ids = img_ids.view(bs, -1, 3)
+        return hidden_states, img_ids, orig_shape
+
+    model.process_img = MethodType(process_img_with_tiles, model)
+    model._tiled_diffusion_qwen_patched = True
+
+
+def _patch_wan_rope_encode(model):
+    if getattr(model, "_tiled_diffusion_wan_patched", False):
+        return
+
+    orig_rope_encode = model.rope_encode
+
+    def rope_encode_with_tiles(self, t, h, w, t_start=0, steps_t=None, steps_h=None, steps_w=None, device=None, dtype=None, transformer_options={}):
+        tile_infos = getattr(self, "_tile_infos", None)
+        if tile_infos is None or len(tile_infos) == 0:
+            return orig_rope_encode(t, h, w, t_start=t_start, steps_t=steps_t, steps_h=steps_h, steps_w=steps_w, device=device, dtype=dtype, transformer_options=transformer_options)
+
+        patch_size = self.patch_size if isinstance(self.patch_size, (tuple, list)) else (1, self.patch_size, self.patch_size)
+        patch_t, patch_h, patch_w = patch_size
+        patch_t = max(int(patch_t), 1)
+        patch_h = max(int(patch_h), 1)
+        patch_w = max(int(patch_w), 1)
+
+        base_param = next(self.parameters(), None)
+        base_device = base_param.device if base_param is not None else torch.device("cpu")
+        base_dtype = base_param.dtype if base_param is not None else torch.float32
+        device = device if device is not None else base_device
+        dtype = dtype if dtype is not None else base_dtype
+
+        infos = _extend_infos(tile_infos, len(tile_infos))
+
+        offsets_t = torch.tensor([_compute_patch_offset(info.get("t", 0), patch_t) for info in infos], device=device, dtype=torch.float32)
+        offsets_h = torch.tensor([_compute_patch_offset(info.get("h", 0), patch_h) for info in infos], device=device, dtype=torch.float32)
+        offsets_w = torch.tensor([_compute_patch_offset(info.get("w", 0), patch_w) for info in infos], device=device, dtype=torch.float32)
+
+        t_len = ((t + (patch_t // 2)) // patch_t)
+        h_len = ((h + (patch_h // 2)) // patch_h)
+        w_len = ((w + (patch_w // 2)) // patch_w)
+
+        if steps_t is None:
+            steps_t = max(int(t_len), 1)
+        if steps_h is None:
+            steps_h = max(int(h_len), 1)
+        if steps_w is None:
+            steps_w = max(int(w_len), 1)
+
+        h_start = 0.0
+        w_start = 0.0
+        scale_t = 1.0
+        scale_y = 1.0
+        scale_x = 1.0
+
+        rope_options = transformer_options.get("rope_options", None)
+        if rope_options is not None:
+            scale_t = rope_options.get("scale_t", 1.0)
+            scale_y = rope_options.get("scale_y", 1.0)
+            scale_x = rope_options.get("scale_x", 1.0)
+            t_len = (t_len - 1.0) * scale_t + 1.0
+            h_len = (h_len - 1.0) * scale_y + 1.0
+            w_len = (w_len - 1.0) * scale_x + 1.0
+            t_start += rope_options.get("shift_t", 0.0)
+            h_start += rope_options.get("shift_y", 0.0)
+            w_start += rope_options.get("shift_x", 0.0)
+
+        offsets_t = offsets_t.to(dtype=dtype) * scale_t
+        offsets_h = offsets_h.to(dtype=dtype) * scale_y
+        offsets_w = offsets_w.to(dtype=dtype) * scale_x
+
+        base_t = torch.linspace(t_start, t_start + (t_len - 1), steps=steps_t, device=device, dtype=dtype)
+        base_h = torch.linspace(h_start, h_start + (h_len - 1), steps=steps_h, device=device, dtype=dtype)
+        base_w = torch.linspace(w_start, w_start + (w_len - 1), steps=steps_w, device=device, dtype=dtype)
+
+        bs = len(offsets_h)
+        img_ids = torch.zeros((bs, steps_t, steps_h, steps_w, 3), device=device, dtype=dtype)
+        img_ids[..., 0] = base_t.view(1, steps_t, 1, 1) + offsets_t.view(bs, 1, 1, 1)
+        img_ids[..., 1] = base_h.view(1, 1, steps_h, 1) + offsets_h.view(bs, 1, 1, 1)
+        img_ids[..., 2] = base_w.view(1, 1, 1, steps_w) + offsets_w.view(bs, 1, 1, 1)
+        img_ids = img_ids.view(bs, -1, 3)
+
+        freqs = self.rope_embedder(img_ids).movedim(1, 2)
+        return freqs
+
+    model.rope_encode = MethodType(rope_encode_with_tiles, model)
+    model._tiled_diffusion_wan_patched = True
+
+
+class _BackendRunner:
+    def __init__(self, base_model: Optional[BaseModel]):
+        self.base_model = base_model
+
+    def __call__(self, model_function: BaseModel.apply_model, x_tile: Tensor, t_tile: Tensor, c_tile: dict, bboxes: List['BBox'], base_batch: int):
+        return model_function(x_tile, t_tile, **c_tile)
+
+
+class _QwenBackendRunner(_BackendRunner):
+    def __init__(self, base_model: BaseModel):
+        super().__init__(base_model)
+        self.diffusion_model = base_model.diffusion_model
+        _patch_qwen_process_img(self.diffusion_model)
+
+    def __call__(self, model_function: BaseModel.apply_model, x_tile: Tensor, t_tile: Tensor, c_tile: dict, bboxes: List['BBox'], base_batch: int):
+        infos = _tile_infos_for_batch(bboxes, x_tile.shape[0])
+        prev_infos = getattr(self.diffusion_model, "_tile_infos", None)
+        if infos:
+            self.diffusion_model._tile_infos = infos
+        try:
+            return super().__call__(model_function, x_tile, t_tile, c_tile, bboxes, base_batch)
+        finally:
+            if infos:
+                if prev_infos is None:
+                    delattr(self.diffusion_model, "_tile_infos")
+                else:
+                    self.diffusion_model._tile_infos = prev_infos
+
+
+class _WanBackendRunner(_BackendRunner):
+    def __init__(self, base_model: BaseModel):
+        super().__init__(base_model)
+        self.diffusion_model = base_model.diffusion_model
+        _patch_wan_rope_encode(self.diffusion_model)
+
+    def __call__(self, model_function: BaseModel.apply_model, x_tile: Tensor, t_tile: Tensor, c_tile: dict, bboxes: List['BBox'], base_batch: int):
+        infos = _tile_infos_for_batch(bboxes, x_tile.shape[0])
+        prev_infos = getattr(self.diffusion_model, "_tile_infos", None)
+        if infos:
+            self.diffusion_model._tile_infos = infos
+        try:
+            return super().__call__(model_function, x_tile, t_tile, c_tile, bboxes, base_batch)
+        finally:
+            if infos:
+                if prev_infos is None:
+                    delattr(self.diffusion_model, "_tile_infos")
+                else:
+                    self.diffusion_model._tile_infos = prev_infos
+
+
+def _create_backend_runner(base_model: Optional[BaseModel]) -> _BackendRunner:
+    if base_model is None:
+        return _BackendRunner(base_model)
+    diff_model = getattr(base_model, "diffusion_model", None)
+    if QwenImageTransformer2DModel is not None and isinstance(diff_model, QwenImageTransformer2DModel):
+        return _QwenBackendRunner(base_model)
+    if WanModel is not None and isinstance(diff_model, WanModel):
+        return _WanBackendRunner(base_model)
+    return _BackendRunner(base_model)
 
 def split_bboxes(w:int, h:int, tile_w:int, tile_h:int, overlap:int=16, init_weight:Union[Tensor, float]=1.0) -> Tuple[List[BBox], Tensor]:
     cols = ceildiv((w - overlap) , (tile_w - overlap))
@@ -150,6 +374,7 @@ class AbstractDiffusion:
         self.imagescale = ImageScale()
         self.uniform_distribution = None
         self.sigmas = None
+        self._backend_runner: Optional[_BackendRunner] = None
 
     def reset(self):
         tile_width = self.tile_width
@@ -202,6 +427,16 @@ class AbstractDiffusion:
             self.x_buffer = torch.zeros_like(x_in, device=x_in.device, dtype=x_in.dtype)
         else:
             self.x_buffer.zero_()
+
+    def get_backend_runner(self, model_function: BaseModel.apply_model) -> _BackendRunner:
+        if self._backend_runner is None:
+            base_model = getattr(model_function, "__self__", None)
+            self._backend_runner = _create_backend_runner(base_model)
+        return self._backend_runner
+
+    def call_model(self, model_function: BaseModel.apply_model, x_tile: Tensor, t_tile: Tensor, c_tile: dict, bboxes: List['BBox'], base_batch: int):
+        runner = self.get_backend_runner(model_function)
+        return runner(model_function, x_tile, t_tile, c_tile, bboxes, base_batch)
 
     @grid_bbox
     def init_grid_bbox(self, tile_w:int, tile_h:int, overlap:int, tile_bs:int):
@@ -527,7 +762,7 @@ class MultiDiffusion(AbstractDiffusion):
                 # stablesr tiling
                 # self.switch_stablesr_tensors(batch_id)
 
-                x_tile_out = model_function(x_tile, t_tile, **c_tile)
+                x_tile_out = self.call_model(model_function, x_tile, t_tile, c_tile, bboxes, N)
 
                 for i, bbox in enumerate(bboxes):
                     self.x_buffer[bbox.slicer] += x_tile_out[i*N:(i+1)*N, :, :, :]
@@ -681,7 +916,7 @@ class SpotDiffusion(AbstractDiffusion):
                 # stablesr tiling
                 # self.switch_stablesr_tensors(batch_id)
 
-                x_tile_out = model_function(x_tile, t_tile, **c_tile)
+                x_tile_out = self.call_model(model_function, x_tile, t_tile, c_tile, bboxes, N)
 
                 for i, bbox in enumerate(bboxes):
                     self.x_buffer[bbox.slicer] = x_tile_out[i*N:(i+1)*N, :, :, :]
@@ -802,7 +1037,7 @@ class MixtureOfDiffusers(AbstractDiffusion):
                 # self.switch_stablesr_tensors(batch_id)
 
                 # denoising: here the x is the noise
-                x_tile_out = model_function(x_tile, t_tile, **c_tile)
+                x_tile_out = self.call_model(model_function, x_tile, t_tile, c_tile, bboxes, N)
 
                 # de-batching
                 for i, bbox in enumerate(bboxes):
