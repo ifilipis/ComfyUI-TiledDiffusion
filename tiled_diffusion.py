@@ -156,31 +156,41 @@ class AbstractDiffusion:
         self.uniform_distribution = None
         self.sigmas = None
 
-    def _get_rope_patch_sizes(self, model_function) -> Tuple[int, int] | None:
+    def _get_rope_patch_sizes(self, model_function) -> Tuple[int, int, int] | None:
         base_model = getattr(model_function, "__self__", None)
         diffusion_model = getattr(base_model, "diffusion_model", None)
         patch_size = getattr(diffusion_model, "patch_size", None)
         if patch_size is None:
             return None
         if isinstance(patch_size, (tuple, list)):
-            if len(patch_size) < 2:
+            if len(patch_size) == 3:
+                patch_t, patch_h, patch_w = patch_size
+            elif len(patch_size) == 2:
+                patch_t, patch_h, patch_w = 1, patch_size[0], patch_size[1]
+            elif len(patch_size) == 1:
+                patch_t, patch_h, patch_w = 1, patch_size[0], patch_size[0]
+            else:
                 return None
-            patch_h, patch_w = patch_size[-2], patch_size[-1]
         else:
+            patch_t = 1
             patch_h = patch_w = patch_size
-        if not isinstance(patch_h, int) or not isinstance(patch_w, int):
+        if not isinstance(patch_t, int) or not isinstance(patch_h, int) or not isinstance(patch_w, int):
             return None
-        if patch_h <= 0 or patch_w <= 0:
+        if patch_t <= 0 or patch_h <= 0 or patch_w <= 0:
             return None
-        return patch_h, patch_w
+        return patch_t, patch_h, patch_w
 
-    def _build_rope_options(self, bbox: BBox, full_h: int, full_w: int, patch_h: int, patch_w: int) -> Dict[str, float]:
+    def _build_rope_options(self, bbox: BBox, full_t: int, full_h: int, full_w: int, tile_t: int, patch_t: int, patch_h: int, patch_w: int) -> Dict[str, float]:
+        global_t_len = (full_t + (patch_t // 2)) // patch_t
         global_h_len = (full_h + (patch_h // 2)) // patch_h
         global_w_len = (full_w + (patch_w // 2)) // patch_w
+        tile_t_len = (tile_t + (patch_t // 2)) // patch_t
         tile_h_len = (bbox.h + (patch_h // 2)) // patch_h
         tile_w_len = (bbox.w + (patch_w // 2)) // patch_w
+        scale_t = (global_t_len - 1) / max(tile_t_len - 1, 1)
         scale_y = (global_h_len - 1) / max(tile_h_len - 1, 1)
         scale_x = (global_w_len - 1) / max(tile_w_len - 1, 1)
+        shift_t = 0
         shift_y = (bbox.y + (patch_h // 2)) // patch_h
         shift_x = (bbox.x + (patch_w // 2)) // patch_w
         return {
@@ -188,16 +198,16 @@ class AbstractDiffusion:
             "shift_x": float(shift_x),
             "scale_y": float(scale_y),
             "shift_y": float(shift_y),
-            "scale_t": 1.0,
-            "shift_t": 0.0,
+            "scale_t": float(scale_t),
+            "shift_t": float(shift_t),
         }
 
-    def _tile_transformer_options(self, transformer_options: dict, model_function, bbox: BBox, full_h: int, full_w: int) -> dict | None:
+    def _tile_transformer_options(self, transformer_options: dict, model_function, bbox: BBox, full_t: int, full_h: int, full_w: int, tile_t: int) -> dict | None:
         patch_sizes = self._get_rope_patch_sizes(model_function)
         if patch_sizes is None:
             return transformer_options
-        patch_h, patch_w = patch_sizes
-        rope_options = self._build_rope_options(bbox, full_h, full_w, patch_h, patch_w)
+        patch_t, patch_h, patch_w = patch_sizes
+        rope_options = self._build_rope_options(bbox, full_t, full_h, full_w, tile_t, patch_t, patch_h, patch_w)
         options = transformer_options.copy() if isinstance(transformer_options, dict) else {}
         rope_base = options.get("rope_options", {})
         if isinstance(rope_base, dict):
@@ -206,6 +216,73 @@ class AbstractDiffusion:
             rope_base = {}
         rope_base.update(rope_options)
         options["rope_options"] = rope_base
+        return options
+
+    def _get_diffusion_model(self, model_function):
+        base_model = getattr(model_function, "__self__", None)
+        return getattr(base_model, "diffusion_model", None)
+
+    def _is_qwen_model(self, model_function) -> bool:
+        diffusion_model = self._get_diffusion_model(model_function)
+        if diffusion_model is None:
+            return False
+        return "QwenImage" in diffusion_model.__class__.__name__
+
+    def _qwen_image_rotary_emb(self, model_function, x_tile: Tensor, context: Tensor, bbox: BBox, full_h: int, full_w: int) -> Tensor | None:
+        if context is None:
+            return None
+        diffusion_model = self._get_diffusion_model(model_function)
+        if diffusion_model is None or not hasattr(diffusion_model, "pe_embedder"):
+            return None
+        patch_size = diffusion_model.patch_size
+        if not isinstance(patch_size, int):
+            return None
+        bs = x_tile.shape[0]
+        t = x_tile.shape[-3] if x_tile.dim() == 5 else 1
+        h = x_tile.shape[-2]
+        w = x_tile.shape[-1]
+        h_len = ((h + (patch_size // 2)) // patch_size)
+        w_len = ((w + (patch_size // 2)) // patch_size)
+        h_offset = ((bbox.y + (patch_size // 2)) // patch_size)
+        w_offset = ((bbox.x + (patch_size // 2)) // patch_size)
+
+        img_ids = torch.zeros((t, h_len, w_len, 3), device=x_tile.device, dtype=x_tile.dtype)
+        if t > 1:
+            img_ids[:, :, :, 0] = img_ids[:, :, :, 0] + torch.linspace(0, t - 1, steps=t, device=x_tile.device, dtype=x_tile.dtype).unsqueeze(1).unsqueeze(1)
+        else:
+            img_ids[:, :, :, 0] = img_ids[:, :, :, 0]
+        img_ids[:, :, :, 1] = img_ids[:, :, :, 1] + torch.linspace(h_offset, h_len - 1 + h_offset, steps=h_len, device=x_tile.device, dtype=x_tile.dtype).unsqueeze(1).unsqueeze(0) - (h_len // 2)
+        img_ids[:, :, :, 2] = img_ids[:, :, :, 2] + torch.linspace(w_offset, w_len - 1 + w_offset, steps=w_len, device=x_tile.device, dtype=x_tile.dtype).unsqueeze(0).unsqueeze(0) - (w_len // 2)
+        img_ids = img_ids.reshape(1, -1, 3).repeat(bs, 1, 1)
+
+        txt_start = round(max(((full_w + (patch_size // 2)) // patch_size) // 2, ((full_h + (patch_size // 2)) // patch_size) // 2))
+        txt_ids = torch.arange(txt_start, txt_start + context.shape[1], device=x_tile.device, dtype=x_tile.dtype).reshape(1, -1, 1).repeat(bs, 1, 3)
+        ids = torch.cat((txt_ids, img_ids), dim=1)
+        image_rotary_emb = diffusion_model.pe_embedder(ids).to(x_tile.dtype).contiguous()
+        return image_rotary_emb
+
+    def _apply_qwen_rope_patch(self, transformer_options: dict, model_function, image_rotary_emb: Tensor) -> dict:
+        options = transformer_options.copy()
+        patches_replace = options.get("patches_replace", {})
+        patches_replace = patches_replace.copy() if isinstance(patches_replace, dict) else {}
+        dit_replace = patches_replace.get("dit", {})
+        dit_replace = dit_replace.copy() if isinstance(dit_replace, dict) else {}
+
+        def qwen_block_replace(args, extra_options):
+            if image_rotary_emb is not None:
+                args = dict(args)
+                args["pe"] = image_rotary_emb
+            return extra_options["original_block"](args)
+
+        diffusion_model = self._get_diffusion_model(model_function)
+        block_count = len(getattr(diffusion_model, "transformer_blocks", ())) if diffusion_model is not None else 0
+        for i in range(block_count):
+            key = ("double_block", i)
+            if key not in dit_replace:
+                dit_replace[key] = qwen_block_replace
+
+        patches_replace["dit"] = dit_replace
+        options["patches_replace"] = patches_replace
         return options
 
     def _slice_control_for_tile(self, control: ControlNet, tile_index: int, batch_size: int) -> list[tuple[ControlNet, Tensor | None]]:
@@ -601,7 +678,13 @@ class MultiDiffusion(AbstractDiffusion):
                                     v = repeat_to_batch_size(v, x_tile.shape[0])
                             c_tile[k] = v
 
-                        transformer_options = self._tile_transformer_options(c_in.get("transformer_options", {}), model_function, bbox, H, W)
+                        full_t = x_in.shape[-3] if x_in.dim() == 5 else 1
+                        tile_t = x_tile.shape[-3] if x_tile.dim() == 5 else 1
+                        transformer_options = self._tile_transformer_options(c_in.get("transformer_options", {}), model_function, bbox, full_t, H, W, tile_t)
+                        if self._is_qwen_model(model_function):
+                            image_rotary_emb = self._qwen_image_rotary_emb(model_function, x_tile, c_tile.get("c_crossattn"), bbox, H, W)
+                            if image_rotary_emb is not None:
+                                transformer_options = self._apply_qwen_rope_patch(transformer_options, model_function, image_rotary_emb)
                         c_tile["transformer_options"] = transformer_options
 
                         if 'control' in c_in:
@@ -808,7 +891,13 @@ class SpotDiffusion(AbstractDiffusion):
                                     v = repeat_to_batch_size(v, x_tile.shape[0])
                             c_tile[k] = v
 
-                        transformer_options = self._tile_transformer_options(c_in.get("transformer_options", {}), model_function, bbox, H, W)
+                        full_t = x_in.shape[-3] if x_in.dim() == 5 else 1
+                        tile_t = x_tile.shape[-3] if x_tile.dim() == 5 else 1
+                        transformer_options = self._tile_transformer_options(c_in.get("transformer_options", {}), model_function, bbox, full_t, H, W, tile_t)
+                        if self._is_qwen_model(model_function):
+                            image_rotary_emb = self._qwen_image_rotary_emb(model_function, x_tile, c_tile.get("c_crossattn"), bbox, H, W)
+                            if image_rotary_emb is not None:
+                                transformer_options = self._apply_qwen_rope_patch(transformer_options, model_function, image_rotary_emb)
                         c_tile["transformer_options"] = transformer_options
 
                         if 'control' in c_in:
@@ -977,7 +1066,13 @@ class MixtureOfDiffusers(AbstractDiffusion):
                                     v = repeat_to_batch_size(v, x_tile.shape[0])
                             c_tile[k] = v
 
-                        transformer_options = self._tile_transformer_options(c_in.get("transformer_options", {}), model_function, bbox, H, W)
+                        full_t = x_in.shape[-3] if x_in.dim() == 5 else 1
+                        tile_t = x_tile.shape[-3] if x_tile.dim() == 5 else 1
+                        transformer_options = self._tile_transformer_options(c_in.get("transformer_options", {}), model_function, bbox, full_t, H, W, tile_t)
+                        if self._is_qwen_model(model_function):
+                            image_rotary_emb = self._qwen_image_rotary_emb(model_function, x_tile, c_tile.get("c_crossattn"), bbox, H, W)
+                            if image_rotary_emb is not None:
+                                transformer_options = self._apply_qwen_rope_patch(transformer_options, model_function, image_rotary_emb)
                         c_tile["transformer_options"] = transformer_options
 
                         if 'control' in c_in:
