@@ -56,6 +56,11 @@ class BBox:
     def __getitem__(self, idx:int) -> int:
         return self.box[idx]
 
+    def slicer_for(self, tensor: Tensor):
+        if tensor.dim() == 5:
+            return slice(None), slice(None), slice(None), slice(self.y, self.y + self.h), slice(self.x, self.x + self.w)
+        return self.slicer
+
 def repeat_to_batch_size(tensor, batch_size, dim=0):
     if dim == 0 and tensor.shape[dim] == 1:
         return tensor.expand([batch_size] + [-1] * (len(tensor.shape) - 1))
@@ -150,6 +155,105 @@ class AbstractDiffusion:
         self.imagescale = ImageScale()
         self.uniform_distribution = None
         self.sigmas = None
+
+    def _get_rope_patch_sizes(self, model_function) -> Tuple[int, int, int] | None:
+        base_model = getattr(model_function, "__self__", None)
+        diffusion_model = getattr(base_model, "diffusion_model", None)
+        patch_size = getattr(diffusion_model, "patch_size", None)
+        if patch_size is None:
+            return None
+        if isinstance(patch_size, (tuple, list)):
+            if len(patch_size) == 3:
+                patch_t, patch_h, patch_w = patch_size
+            elif len(patch_size) == 2:
+                patch_t, patch_h, patch_w = 1, patch_size[0], patch_size[1]
+            elif len(patch_size) == 1:
+                patch_t, patch_h, patch_w = 1, patch_size[0], patch_size[0]
+            else:
+                return None
+        else:
+            patch_t = 1
+            patch_h = patch_w = patch_size
+        if not isinstance(patch_t, int) or not isinstance(patch_h, int) or not isinstance(patch_w, int):
+            return None
+        if patch_t <= 0 or patch_h <= 0 or patch_w <= 0:
+            return None
+        return patch_t, patch_h, patch_w
+
+    def _build_rope_options(self, bbox: BBox, full_t: int, full_h: int, full_w: int, tile_t: int, patch_t: int, patch_h: int, patch_w: int) -> Dict[str, float]:
+        global_t_len = (full_t + (patch_t // 2)) // patch_t
+        global_h_len = (full_h + (patch_h // 2)) // patch_h
+        global_w_len = (full_w + (patch_w // 2)) // patch_w
+        tile_t_len = (tile_t + (patch_t // 2)) // patch_t
+        tile_h_len = (bbox.h + (patch_h // 2)) // patch_h
+        tile_w_len = (bbox.w + (patch_w // 2)) // patch_w
+        scale_t = (global_t_len - 1) / max(tile_t_len - 1, 1)
+        scale_y = (global_h_len - 1) / max(tile_h_len - 1, 1)
+        scale_x = (global_w_len - 1) / max(tile_w_len - 1, 1)
+        shift_t = 0
+        shift_y = (bbox.y + (patch_h // 2)) // patch_h
+        shift_x = (bbox.x + (patch_w // 2)) // patch_w
+        return {
+            "scale_x": float(scale_x),
+            "shift_x": float(shift_x),
+            "scale_y": float(scale_y),
+            "shift_y": float(shift_y),
+            "scale_t": float(scale_t),
+            "shift_t": float(shift_t),
+        }
+
+    def _tile_transformer_options(self, transformer_options: dict, model_function, bbox: BBox, full_t: int, full_h: int, full_w: int, tile_t: int) -> dict | None:
+        patch_sizes = self._get_rope_patch_sizes(model_function)
+        if patch_sizes is None:
+            return transformer_options
+        patch_t, patch_h, patch_w = patch_sizes
+        rope_options = self._build_rope_options(bbox, full_t, full_h, full_w, tile_t, patch_t, patch_h, patch_w)
+        options = transformer_options.copy() if isinstance(transformer_options, dict) else {}
+        rope_base = options.get("rope_options", {})
+        if isinstance(rope_base, dict):
+            rope_base = rope_base.copy()
+        else:
+            rope_base = {}
+        rope_base.update(rope_options)
+        options["rope_options"] = rope_base
+        return options
+
+    def _get_diffusion_model(self, model_function):
+        base_model = getattr(model_function, "__self__", None)
+        return getattr(base_model, "diffusion_model", None)
+
+    def _is_qwen_model(self, model_function) -> bool:
+        diffusion_model = self._get_diffusion_model(model_function)
+        if diffusion_model is None:
+            return False
+        return "QwenImage" in diffusion_model.__class__.__name__
+
+    def _patch_qwen_process_img(self, model_function, bbox: BBox, tile_index: int):
+        diffusion_model = self._get_diffusion_model(model_function)
+        if diffusion_model is None or not hasattr(diffusion_model, "process_img"):
+            return None
+        original_process_img = diffusion_model.process_img
+
+        def process_img_patched(x, index=0, h_offset=0, w_offset=0):
+            return original_process_img(x, index=tile_index, h_offset=bbox.y, w_offset=bbox.x)
+
+        diffusion_model.process_img = process_img_patched
+        return original_process_img
+
+    def _slice_control_for_tile(self, control: ControlNet, tile_index: int, batch_size: int) -> list[tuple[ControlNet, Tensor | None]]:
+        saved = []
+        while control is not None:
+            saved.append((control, getattr(control, "cond_hint", None)))
+            if control.cond_hint is not None:
+                start = tile_index * batch_size
+                end = start + batch_size
+                control.cond_hint = control.cond_hint[start:end]
+            control = control.previous_controlnet
+        return saved
+
+    def _restore_control(self, saved: list[tuple[ControlNet, Tensor | None]]) -> None:
+        for control, cond_hint in saved:
+            control.cond_hint = cond_hint
 
     def reset(self):
         tile_width = self.tile_width
@@ -472,7 +576,10 @@ class MultiDiffusion(AbstractDiffusion):
         c_in: dict = args["c"]
         cond_or_uncond: List = args["cond_or_uncond"]
 
-        N, C, H, W = x_in.shape
+        N = x_in.shape[0]
+        H, W = x_in.shape[-2], x_in.shape[-1]
+        rope_enabled = self._get_rope_patch_sizes(model_function) is not None
+        rope_enabled = self._get_rope_patch_sizes(model_function) is not None
 
         # comfyui can feed in a latent that's a different size cause of SetArea, so we'll refresh in that case.
         self.refresh = False
@@ -493,8 +600,65 @@ class MultiDiffusion(AbstractDiffusion):
                     # self.pbar.close()
                     return x_in
 
+                if rope_enabled:
+                    if 'control' in c_in:
+                        x_tile_batch = torch.cat([x_in[bbox.slicer_for(x_in)] for bbox in bboxes], dim=0)
+                        self.process_controlnet(x_tile_batch, c_in, cond_or_uncond, bboxes, N, batch_id)
+                    bboxes_by_shape = {}
+                    for tile_index, bbox in enumerate(bboxes):
+                        x_tile = x_in[bbox.slicer_for(x_in)]
+                        t_tile = repeat_to_batch_size(t_in, x_tile.shape[0])
+                        c_tile = {}
+                        for k, v in c_in.items():
+                            if isinstance(v, torch.Tensor):
+                                if len(v.shape) == len(x_tile.shape):
+                                    bbox_ = bbox
+                                    if v.shape[-2:] != x_in.shape[-2:]:
+                                        key = v.shape[-2:]
+                                        if key not in bboxes_by_shape:
+                                            cf = x_in.shape[-1] * self.compression // v.shape[-1] # compression factor
+                                            bboxes_by_shape[key] = self.get_grid_bbox(
+                                                self.width // cf,
+                                                self.height // cf,
+                                                self.overlap // cf,
+                                                self.tile_batch_size,
+                                                v.shape[-1],
+                                                v.shape[-2],
+                                                x_in.device,
+                                                self.get_tile_weights,
+                                            )
+                                        bbox_ = bboxes_by_shape[key][batch_id][tile_index]
+                                    v = v[bbox_.slicer_for(v)]
+                                if v.shape[0] != x_tile.shape[0]:
+                                    v = repeat_to_batch_size(v, x_tile.shape[0])
+                            c_tile[k] = v
+
+                        full_t = x_in.shape[-3] if x_in.dim() == 5 else 1
+                        tile_t = x_tile.shape[-3] if x_tile.dim() == 5 else 1
+                        transformer_options = self._tile_transformer_options(c_in.get("transformer_options", {}), model_function, bbox, full_t, H, W, tile_t)
+                        c_tile["transformer_options"] = transformer_options
+
+                        if 'control' in c_in:
+                            saved = self._slice_control_for_tile(c_in['control'], tile_index, N)
+                            c_tile['control'] = c_in['control'].get_control_orig(
+                                x_tile, t_tile, c_tile, len(cond_or_uncond), transformer_options
+                            )
+                            self._restore_control(saved)
+
+                        original_process_img = None
+                        if self._is_qwen_model(model_function):
+                            original_process_img = self._patch_qwen_process_img(model_function, bbox, tile_index)
+                        try:
+                            x_tile_out = model_function(x_tile, t_tile, **c_tile)
+                        finally:
+                            if original_process_img is not None:
+                                self._get_diffusion_model(model_function).process_img = original_process_img
+                        self.x_buffer[bbox.slicer_for(self.x_buffer)] += x_tile_out
+                        del x_tile_out, x_tile, t_tile, c_tile
+                    continue
+
                 # batching & compute tiles
-                x_tile = torch.cat([x_in[bbox.slicer] for bbox in bboxes], dim=0)   # [TB, C, TH, TW]
+                x_tile = torch.cat([x_in[bbox.slicer_for(x_in)] for bbox in bboxes], dim=0)   # [TB, C, TH, TW]
                 t_tile = repeat_to_batch_size(t_in, x_tile.shape[0])
                 c_tile = {}
                 for k, v in c_in.items():
@@ -513,7 +677,7 @@ class MultiDiffusion(AbstractDiffusion):
                                     x_in.device,
                                     self.get_tile_weights,
                                 )
-                            v = torch.cat([v[bbox_.slicer] for bbox_ in bboxes_[batch_id]])
+                            v = torch.cat([v[bbox_.slicer_for(v)] for bbox_ in bboxes_[batch_id]])
                         if v.shape[0] != x_tile.shape[0]:
                             v = repeat_to_batch_size(v, x_tile.shape[0])
                     c_tile[k] = v
@@ -522,7 +686,7 @@ class MultiDiffusion(AbstractDiffusion):
                 # self.switch_controlnet_tensors(batch_id, N, len(bboxes))
                 if 'control' in c_in:
                     self.process_controlnet(x_tile, c_in, cond_or_uncond, bboxes, N, batch_id)
-                    c_tile['control'] = c_in['control'].get_control_orig(x_tile, t_tile, c_tile, len(cond_or_uncond), c_in['transformer_options'])
+                    c_tile['control'] = c_in['control'].get_control_orig(x_tile, t_tile, c_tile, len(cond_or_uncond), c_tile['transformer_options'])
 
                 # stablesr tiling
                 # self.switch_stablesr_tensors(batch_id)
@@ -530,7 +694,7 @@ class MultiDiffusion(AbstractDiffusion):
                 x_tile_out = model_function(x_tile, t_tile, **c_tile)
 
                 for i, bbox in enumerate(bboxes):
-                    self.x_buffer[bbox.slicer] += x_tile_out[i*N:(i+1)*N, :, :, :]
+                    self.x_buffer[bbox.slicer_for(self.x_buffer)] += x_tile_out[i*N:(i+1)*N]
                 del x_tile_out, x_tile, t_tile, c_tile
 
                 # update progress bar
@@ -579,7 +743,8 @@ class SpotDiffusion(AbstractDiffusion):
         c_in: dict = args["c"]
         cond_or_uncond: List = args["cond_or_uncond"]
 
-        N, C, H, W = x_in.shape
+        N = x_in.shape[0]
+        H, W = x_in.shape[-2], x_in.shape[-1]
 
         # comfyui can feed in a latent that's a different size cause of SetArea, so we'll refresh in that case.
         self.refresh = False
@@ -644,8 +809,72 @@ class SpotDiffusion(AbstractDiffusion):
                     # self.pbar.close()
                     return x_in
 
+                if rope_enabled:
+                    if 'control' in c_in:
+                        x_tile_batch = torch.cat([x_in[bbox.slicer_for(x_in)] for bbox in bboxes], dim=0)
+                        self.process_controlnet(x_tile_batch, c_in, cond_or_uncond, bboxes, N, batch_id, (sh_h,sh_w), condition)
+                    bboxes_by_shape = {}
+                    for tile_index, bbox in enumerate(bboxes):
+                        x_tile = x_in[bbox.slicer_for(x_in)]
+                        t_tile = repeat_to_batch_size(t_in, x_tile.shape[0])
+                        c_tile = {}
+                        for k, v in c_in.items():
+                            if isinstance(v, torch.Tensor):
+                                if len(v.shape) == len(x_tile.shape):
+                                    bbox_ = bbox
+                                    sh_h_new, sh_w_new = sh_h, sh_w
+                                    if v.shape[-2:] != x_in.shape[-2:]:
+                                        key = v.shape[-2:]
+                                        if key not in bboxes_by_shape:
+                                            cf = x_in.shape[-1] * self.compression // v.shape[-1] # compression factor
+                                            bboxes_by_shape[key] = (
+                                                self.get_grid_bbox(
+                                                    self.width // cf,
+                                                    self.height // cf,
+                                                    self.overlap // cf,
+                                                    self.tile_batch_size,
+                                                    v.shape[-1],
+                                                    v.shape[-2],
+                                                    x_in.device,
+                                                    self.get_tile_weights,
+                                                ),
+                                                round(sh_h * self.compression / cf),
+                                                round(sh_w * self.compression / cf),
+                                            )
+                                        bboxes_, sh_h_new, sh_w_new = bboxes_by_shape[key]
+                                        bbox_ = bboxes_[batch_id][tile_index]
+                                    v = v.roll(shifts=(sh_h_new, sh_w_new), dims=(-2,-1))
+                                    v = v[bbox_.slicer_for(v)]
+                                if v.shape[0] != x_tile.shape[0]:
+                                    v = repeat_to_batch_size(v, x_tile.shape[0])
+                            c_tile[k] = v
+
+                        full_t = x_in.shape[-3] if x_in.dim() == 5 else 1
+                        tile_t = x_tile.shape[-3] if x_tile.dim() == 5 else 1
+                        transformer_options = self._tile_transformer_options(c_in.get("transformer_options", {}), model_function, bbox, full_t, H, W, tile_t)
+                        c_tile["transformer_options"] = transformer_options
+
+                        if 'control' in c_in:
+                            saved = self._slice_control_for_tile(c_in['control'], tile_index, N)
+                            c_tile['control'] = c_in['control'].get_control_orig(
+                                x_tile, t_tile, c_tile, len(cond_or_uncond), transformer_options
+                            )
+                            self._restore_control(saved)
+
+                        original_process_img = None
+                        if self._is_qwen_model(model_function):
+                            original_process_img = self._patch_qwen_process_img(model_function, bbox, tile_index)
+                        try:
+                            x_tile_out = model_function(x_tile, t_tile, **c_tile)
+                        finally:
+                            if original_process_img is not None:
+                                self._get_diffusion_model(model_function).process_img = original_process_img
+                        self.x_buffer[bbox.slicer_for(self.x_buffer)] = x_tile_out
+                        del x_tile_out, x_tile, t_tile, c_tile
+                    continue
+
                 # batching & compute tiles
-                x_tile = torch.cat([x_in[bbox.slicer] for bbox in bboxes], dim=0)   # [TB, C, TH, TW]
+                x_tile = torch.cat([x_in[bbox.slicer_for(x_in)] for bbox in bboxes], dim=0)   # [TB, C, TH, TW]
                 t_tile = repeat_to_batch_size(t_in, x_tile.shape[0])
                 c_tile = {}
                 for k, v in c_in.items():
@@ -667,7 +896,7 @@ class SpotDiffusion(AbstractDiffusion):
                                 )
                                 sh_h_new, sh_w_new = round(sh_h * self.compression / cf), round(sh_w * self.compression / cf)
                             v = v.roll(shifts=(sh_h_new, sh_w_new), dims=(-2,-1))
-                            v = torch.cat([v[bbox_.slicer] for bbox_ in bboxes_[batch_id]])
+                            v = torch.cat([v[bbox_.slicer_for(v)] for bbox_ in bboxes_[batch_id]])
                         if v.shape[0] != x_tile.shape[0]:
                             v = repeat_to_batch_size(v, x_tile.shape[0])
                     c_tile[k] = v
@@ -676,7 +905,7 @@ class SpotDiffusion(AbstractDiffusion):
                 # self.switch_controlnet_tensors(batch_id, N, len(bboxes))
                 if 'control' in c_in:
                     self.process_controlnet(x_tile, c_in, cond_or_uncond, bboxes, N, batch_id, (sh_h,sh_w), condition)
-                    c_tile['control'] = c_in['control'].get_control_orig(x_tile, t_tile, c_tile, len(cond_or_uncond), c_in['transformer_options'])
+                    c_tile['control'] = c_in['control'].get_control_orig(x_tile, t_tile, c_tile, len(cond_or_uncond), c_tile['transformer_options'])
 
                 # stablesr tiling
                 # self.switch_stablesr_tensors(batch_id)
@@ -684,7 +913,7 @@ class SpotDiffusion(AbstractDiffusion):
                 x_tile_out = model_function(x_tile, t_tile, **c_tile)
 
                 for i, bbox in enumerate(bboxes):
-                    self.x_buffer[bbox.slicer] = x_tile_out[i*N:(i+1)*N, :, :, :]
+                    self.x_buffer[bbox.slicer_for(self.x_buffer)] = x_tile_out[i*N:(i+1)*N]
 
                 del x_tile_out, x_tile, t_tile, c_tile
 
@@ -740,7 +969,9 @@ class MixtureOfDiffusers(AbstractDiffusion):
         c_in: dict = args["c"]
         cond_or_uncond: List= args["cond_or_uncond"]
 
-        N, C, H, W = x_in.shape
+        N = x_in.shape[0]
+        H, W = x_in.shape[-2], x_in.shape[-1]
+        rope_enabled = self._get_rope_patch_sizes(model_function) is not None
 
         self.refresh = False
         # self.refresh = True
@@ -763,10 +994,68 @@ class MixtureOfDiffusers(AbstractDiffusion):
                 if processing_interrupted(): 
                     # self.pbar.close()
                     return x_in
+                if rope_enabled:
+                    if 'control' in c_in:
+                        x_tile_batch = torch.cat([x_in[bbox.slicer_for(x_in)] for bbox in bboxes], dim=0)
+                        self.process_controlnet(x_tile_batch, c_in, cond_or_uncond, bboxes, N, batch_id)
+                    bboxes_by_shape = {}
+                    for tile_index, bbox in enumerate(bboxes):
+                        x_tile = x_in[bbox.slicer_for(x_in)]
+                        t_tile = repeat_to_batch_size(t_in, x_tile.shape[0])
+                        c_tile = {}
+                        for k, v in c_in.items():
+                            if isinstance(v, torch.Tensor):
+                                if len(v.shape) == len(x_tile.shape):
+                                    bbox_ = bbox
+                                    if v.shape[-2:] != x_in.shape[-2:]:
+                                        key = v.shape[-2:]
+                                        if key not in bboxes_by_shape:
+                                            cf = x_in.shape[-1] * self.compression // v.shape[-1] # compression factor
+                                            bboxes_by_shape[key] = self.get_grid_bbox(
+                                                (tile_w := self.width // cf),
+                                                (tile_h := self.height // cf),
+                                                self.overlap // cf,
+                                                self.tile_batch_size,
+                                                v.shape[-1],
+                                                v.shape[-2],
+                                                x_in.device,
+                                                lambda: self.get_weight(tile_w, tile_h),
+                                            )
+                                        bbox_ = bboxes_by_shape[key][batch_id][tile_index]
+                                    v = v[bbox_.slicer_for(v)]
+                                if v.shape[0] != x_tile.shape[0]:
+                                    v = repeat_to_batch_size(v, x_tile.shape[0])
+                            c_tile[k] = v
+
+                        full_t = x_in.shape[-3] if x_in.dim() == 5 else 1
+                        tile_t = x_tile.shape[-3] if x_tile.dim() == 5 else 1
+                        transformer_options = self._tile_transformer_options(c_in.get("transformer_options", {}), model_function, bbox, full_t, H, W, tile_t)
+                        c_tile["transformer_options"] = transformer_options
+
+                        if 'control' in c_in:
+                            saved = self._slice_control_for_tile(c_in['control'], tile_index, N)
+                            c_tile['control'] = c_in['control'].get_control_orig(
+                                x_tile, t_tile, c_tile, len(cond_or_uncond), transformer_options
+                            )
+                            self._restore_control(saved)
+
+                        original_process_img = None
+                        if self._is_qwen_model(model_function):
+                            original_process_img = self._patch_qwen_process_img(model_function, bbox, tile_index)
+                        try:
+                            x_tile_out = model_function(x_tile, t_tile, **c_tile)
+                        finally:
+                            if original_process_img is not None:
+                                self._get_diffusion_model(model_function).process_img = original_process_img
+                        w = self.tile_weights * self.rescale_factor[bbox.slicer]
+                        self.x_buffer[bbox.slicer_for(self.x_buffer)] += x_tile_out * w
+                        del x_tile_out, x_tile, t_tile, c_tile
+                    continue
+
                 # batching
                 x_tile_list     = []
                 for bbox in bboxes:
-                    x_tile_list.append(x_in[bbox.slicer])
+                    x_tile_list.append(x_in[bbox.slicer_for(x_in)])
 
                 x_tile = torch.cat(x_tile_list, dim=0)                     # differs each
                 t_tile = repeat_to_batch_size(t_in, x_tile.shape[0])   # just repeat
@@ -787,7 +1076,7 @@ class MixtureOfDiffusers(AbstractDiffusion):
                                     x_in.device,
                                     lambda: self.get_weight(tile_w, tile_h),
                                 )
-                            v = torch.cat([v[bbox_.slicer] for bbox_ in bboxes_[batch_id]])
+                            v = torch.cat([v[bbox_.slicer_for(v)] for bbox_ in bboxes_[batch_id]])
                         if v.shape[0] != x_tile.shape[0]:
                             v = repeat_to_batch_size(v, x_tile.shape[0])
                     c_tile[k] = v
@@ -796,7 +1085,7 @@ class MixtureOfDiffusers(AbstractDiffusion):
                 # self.switch_controlnet_tensors(batch_id, N, len(bboxes), is_denoise=True)
                 if 'control' in c_in:
                     self.process_controlnet(x_tile, c_in, cond_or_uncond, bboxes, N, batch_id)
-                    c_tile['control'] = c_in['control'].get_control_orig(x_tile, t_tile, c_tile, len(cond_or_uncond), c_in['transformer_options'])
+                    c_tile['control'] = c_in['control'].get_control_orig(x_tile, t_tile, c_tile, len(cond_or_uncond), c_tile['transformer_options'])
                 
                 # stablesr
                 # self.switch_stablesr_tensors(batch_id)
@@ -809,7 +1098,7 @@ class MixtureOfDiffusers(AbstractDiffusion):
                     # These weights can be calcluated in advance, but will cost a lot of vram 
                     # when you have many tiles. So we calculate it here.
                     w = self.tile_weights * self.rescale_factor[bbox.slicer]
-                    self.x_buffer[bbox.slicer] += x_tile_out[i*N:(i+1)*N, :, :, :] * w
+                    self.x_buffer[bbox.slicer_for(self.x_buffer)] += x_tile_out[i*N:(i+1)*N] * w
                 del x_tile_out, x_tile, t_tile, c_tile
 
                 # self.update_pbar()
